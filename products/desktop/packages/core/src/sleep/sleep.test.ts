@@ -15,9 +15,11 @@ function makeLogger() {
 
 function createDeps(preventSleepInitially = true) {
   const release = vi.fn();
+  const unsubscribeSuspend = vi.fn();
+  const unsubscribeResume = vi.fn();
   const powerManager: IPowerManager = {
-    onSuspend: vi.fn(() => () => {}),
-    onResume: vi.fn(() => () => {}),
+    onSuspend: vi.fn(() => unsubscribeSuspend),
+    onResume: vi.fn(() => unsubscribeResume),
     preventSleep: vi.fn(() => release),
     hasBuiltInBattery: vi.fn(async () => false),
   };
@@ -32,7 +34,14 @@ function createDeps(preventSleepInitially = true) {
 
   const service = new SleepService(powerManager, settings, makeLogger());
 
-  return { service, powerManager, settings, release };
+  return {
+    service,
+    powerManager,
+    settings,
+    release,
+    unsubscribeSuspend,
+    unsubscribeResume,
+  };
 }
 
 describe("SleepService", () => {
@@ -49,6 +58,38 @@ describe("SleepService", () => {
 
   it("does not block sleep when enabled but no activity is active", () => {
     expect(ctx.powerManager.preventSleep).not.toHaveBeenCalled();
+  });
+
+  it("streams complete suspend cycles and releases its listeners", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_000);
+      const controller = new AbortController();
+      const cycles = ctx.service.watchSuspendCycles(controller.signal);
+      const firstCycle = cycles.next();
+      const suspend = vi.mocked(ctx.powerManager.onSuspend).mock.calls[0][0];
+      const resume = vi.mocked(ctx.powerManager.onResume).mock.calls[0][0];
+
+      suspend();
+      vi.setSystemTime(16_000);
+      resume();
+
+      await expect(firstCycle).resolves.toEqual({
+        done: false,
+        value: { startedAt: 1_000, endedAt: 16_000 },
+      });
+
+      const completion = cycles.next();
+      controller.abort();
+      await expect(completion).resolves.toEqual({
+        done: true,
+        value: undefined,
+      });
+      expect(ctx.unsubscribeSuspend).toHaveBeenCalledOnce();
+      expect(ctx.unsubscribeResume).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("blocks sleep once an activity is acquired while enabled", () => {
