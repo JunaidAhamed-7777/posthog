@@ -1846,6 +1846,10 @@ export class SessionService {
     wallClockMs: number;
     activeClockMs: number;
   } | null = null;
+  private deferredLocalSuspends = new Map<
+    string,
+    { durationMs: number; latestSuspendStartedAtMs: number }
+  >();
   /** Active cloud task watchers, keyed by taskId */
   private cloudTaskWatchers = new Map<string, CloudTaskWatcher>();
   private olderTranscriptLoads = new Set<string>();
@@ -3051,10 +3055,14 @@ export class SessionService {
       wallClockMs: now,
       activeClockMs: activeNow,
     };
+    if (event) {
+      this.applyDeferredLocalSuspend(event);
+    }
     const wallClockElapsedMs = now - previousCheck.wallClockMs;
     const activeClockElapsedMs = activeNow - previousCheck.activeClockMs;
     const suspendedMs = wallClockElapsedMs - activeClockElapsedMs;
     if (suspendedMs <= LOCAL_SUSPEND_DETECT_MARGIN_MS) return;
+    const suspendStartedAtMs = now - suspendedMs;
 
     for (const session of Object.values(this.d.store.getSessions())) {
       if (
@@ -3066,8 +3074,22 @@ export class SessionService {
       }
       if (
         event?.taskRunId === session.taskRunId &&
-        event.timestamp <= previousCheck.wallClockMs
+        event.timestamp <= suspendStartedAtMs
       ) {
+        const promptElapsedMs = Math.max(
+          0,
+          now - (session.promptStartedAt ?? now),
+        );
+        const existing = this.deferredLocalSuspends.get(session.taskRunId);
+        this.deferredLocalSuspends.set(session.taskRunId, {
+          durationMs:
+            (existing?.durationMs ?? 0) +
+            Math.min(suspendedMs, promptElapsedMs),
+          latestSuspendStartedAtMs: Math.max(
+            existing?.latestSuspendStartedAtMs ?? 0,
+            suspendStartedAtMs,
+          ),
+        });
         continue;
       }
       const promptElapsedMs = Math.max(
@@ -3080,6 +3102,22 @@ export class SessionService {
           Math.min(suspendedMs, promptElapsedMs),
       });
     }
+  }
+
+  private applyDeferredLocalSuspend(event: {
+    taskRunId: string;
+    timestamp: number;
+  }): void {
+    const deferred = this.deferredLocalSuspends.get(event.taskRunId);
+    if (!deferred || event.timestamp <= deferred.latestSuspendStartedAtMs) {
+      return;
+    }
+    this.deferredLocalSuspends.delete(event.taskRunId);
+    const session = this.d.store.getSessions()[event.taskRunId];
+    if (!session || session.isCloud || !session.isPromptPending) return;
+    this.d.store.updateSession(event.taskRunId, {
+      pausedDurationMs: (session.pausedDurationMs ?? 0) + deferred.durationMs,
+    });
   }
 
   private checkLocalSessionSilence(): void {
@@ -3118,6 +3156,7 @@ export class SessionService {
       clearInterval(this.silenceCheckHandle);
       this.silenceCheckHandle = null;
       this.lastSilenceCheckAt = null;
+      this.deferredLocalSuspends.clear();
     }
   }
 
@@ -3406,6 +3445,7 @@ export class SessionService {
       this.silenceCheckHandle = null;
     }
     this.lastSilenceCheckAt = null;
+    this.deferredLocalSuspends.clear();
     for (const timer of this.eventEvictionTimers.values()) clearTimeout(timer);
     this.eventEvictionTimers.clear();
     for (const { timer } of this.connectingToastTimers.values()) {
@@ -4676,6 +4716,7 @@ export class SessionService {
   ): void {
     const now = Date.now();
     this.recordLocalSuspend(now);
+    this.deferredLocalSuspends.delete(taskRunId);
     this.d.store.updateSession(taskRunId, {
       isPromptPending: true,
       promptStartedAt: now,

@@ -193,6 +193,7 @@ describe("session event diagnostics", () => {
         clockJumpMs: 2 * 60 * 60_000,
         activeClockJumpMs: 0,
         eventAfterJump: true,
+        staleEventAfterJump: false,
         expectedPausedMs: 2 * 60 * 60_000,
       },
       {
@@ -200,6 +201,7 @@ describe("session event diagnostics", () => {
         clockJumpMs: 60_000,
         activeClockJumpMs: 0,
         eventAfterJump: true,
+        staleEventAfterJump: false,
         expectedPausedMs: null,
       },
       {
@@ -207,6 +209,7 @@ describe("session event diagnostics", () => {
         clockJumpMs: 2 * 60 * 60_000,
         activeClockJumpMs: 0,
         eventAfterJump: false,
+        staleEventAfterJump: false,
         expectedPausedMs: null,
       },
       {
@@ -214,7 +217,16 @@ describe("session event diagnostics", () => {
         clockJumpMs: 2 * 60 * 60_000,
         activeClockJumpMs: 2 * 60 * 60_000,
         eventAfterJump: true,
+        staleEventAfterJump: false,
         expectedPausedMs: null,
+      },
+      {
+        name: "defers a suspend when a stale chunk precedes a fresh completion",
+        clockJumpMs: 2 * 60 * 60_000,
+        activeClockJumpMs: 0,
+        eventAfterJump: true,
+        staleEventAfterJump: true,
+        expectedPausedMs: 2 * 60 * 60_000,
       },
     ])("$name", (scenario) => {
       const {
@@ -241,6 +253,12 @@ describe("session event diagnostics", () => {
 
         vi.setSystemTime(beforeJump + clockJumpMs);
         performanceNow.mockReturnValue(activeClockJumpMs);
+        if (scenario.staleEventAfterJump) {
+          events.subscriptions[0].handlers.onData({
+            ...chunk,
+            ts: beforeJump,
+          });
+        }
         events.subscriptions[0].handlers.onData(
           completion(eventAfterJump ? Date.now() : beforeJump),
         );
