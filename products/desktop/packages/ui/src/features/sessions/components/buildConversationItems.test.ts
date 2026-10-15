@@ -5,7 +5,10 @@ import {
   buildConversationItems,
   type ConversationItem,
   hasSetupProgressForRun,
+  lastGenerationDurationMs,
 } from "./buildConversationItems";
+
+const HOUR_MS = 60 * 60_000;
 
 function consoleMsg(ts: number, message: string, level = "info"): AcpMessage {
   return {
@@ -643,9 +646,53 @@ describe("buildConversationItems", () => {
     expect(result.lastTurnInfo).toEqual({
       isComplete: true,
       durationMs: 15,
+      longestGapMs: 15,
       stopReason: "end_turn",
     });
   });
+
+  it.each([
+    {
+      name: "a short turn",
+      gapMs: 60_000,
+      pausedDurationMs: 0,
+      expectedDurationMs: 70_000,
+    },
+    {
+      name: "a permission wait",
+      gapMs: 3 * HOUR_MS,
+      pausedDurationMs: 3 * HOUR_MS,
+      expectedDurationMs: 10_000,
+    },
+    {
+      name: "a detected sleep",
+      gapMs: 2 * HOUR_MS,
+      pausedDurationMs: 2 * HOUR_MS - 30_000,
+      expectedDurationMs: 40_000,
+    },
+    {
+      name: "an unexplained overnight gap",
+      gapMs: 22 * HOUR_MS,
+      pausedDurationMs: 0,
+      expectedDurationMs: null,
+    },
+  ])(
+    "reports the generation duration for $name",
+    ({ gapMs, pausedDurationMs, expectedDurationMs }) => {
+      const { lastTurnInfo } = buildConversationItems(
+        [
+          userPromptMsg(1_000, 1, "hello"),
+          agentMessageMsg(11_000, "working"),
+          turnCompleteMsg(11_000 + gapMs),
+        ],
+        null,
+      );
+
+      expect(
+        lastGenerationDurationMs(lastTurnInfo, pausedDurationMs),
+      ).toBe(expectedDurationMs);
+    },
+  );
 
   it("keeps attachment-only prompts visible", () => {
     const uri = makeAttachmentUri("/tmp/test.txt");

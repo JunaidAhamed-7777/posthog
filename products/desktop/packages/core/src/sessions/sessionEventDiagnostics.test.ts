@@ -177,5 +177,47 @@ describe("session event diagnostics", () => {
         vi.useRealTimers();
       }
     });
+
+    it.each([
+      {
+        name: "records a long clock jump before the completion event is applied",
+        clockJumpMs: 2 * 60 * 60_000,
+        expectedPausedMs: 2 * 60 * 60_000 - 30_000,
+      },
+      {
+        name: "ignores normal timer throttling",
+        clockJumpMs: 60_000,
+        expectedPausedMs: null,
+      },
+    ])("$name", ({ clockJumpMs, expectedPausedMs }) => {
+      vi.useFakeTimers();
+      try {
+        const { events, deps, service } = createHarness({
+          isPromptPending: true,
+          promptStartedAt: Date.now(),
+          pausedDurationMs: 0,
+        });
+        events.subscriptions[0].handlers.onData(chunk);
+        const updateSession = deps.store.updateSession as ReturnType<
+          typeof vi.fn
+        >;
+        updateSession.mockClear();
+
+        vi.setSystemTime(Date.now() + clockJumpMs);
+        events.subscriptions[0].handlers.onData(chunk);
+
+        const pauseUpdates = updateSession.mock.calls.filter(
+          ([, patch]) => "pausedDurationMs" in patch,
+        );
+        expect(pauseUpdates).toEqual(
+          expectedPausedMs === null
+            ? []
+            : [[RUN_ID, { pausedDurationMs: expectedPausedMs }]],
+        );
+        service.reset();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 });
