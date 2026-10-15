@@ -2938,16 +2938,17 @@ export class SessionService {
   private lastAgentTextAt = new Map<string, number>();
 
   private enqueueSessionEvent(taskRunId: string, acpMsg: AcpMessage): void {
-    this.recordLocalSuspend(Date.now());
+    const now = Date.now();
+    this.recordLocalSuspend(now);
     this.hostEndedResubscribes.delete(taskRunId);
-    this.lastSessionEventAt.set(taskRunId, Date.now());
+    this.lastSessionEventAt.set(taskRunId, now);
     this.silenceLogged.delete(taskRunId);
     this.ensureSilenceCheck();
     const stats = this.statsFor(taskRunId);
     stats.received += 1;
     stats.lastMethod = describeAcpMethod(acpMsg);
     if (isAgentTextStreamEvent(acpMsg)) {
-      this.lastAgentTextAt.set(taskRunId, Date.now());
+      this.lastAgentTextAt.set(taskRunId, now);
     }
     const buffered = this.pendingSessionEvents.get(taskRunId);
     if (buffered) {
