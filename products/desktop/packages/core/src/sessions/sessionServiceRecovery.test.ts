@@ -51,6 +51,9 @@ function createHarness({
 } = {}) {
   const sessions: Record<string, AgentSession> = {};
   let rendererClosingHandler: ((closedAt: number) => void) | undefined;
+  let suspendHandler:
+    | ((cycle: { startedAt: number; endedAt: number }) => void)
+    | undefined;
   const store = {
     getSessions: () => sessions,
     getSessionByTaskId: (taskId: string) =>
@@ -92,6 +95,12 @@ function createHarness({
       rendererClosingHandler = handler;
       return vi.fn();
     },
+    subscribeToSystemSuspend: (
+      handler: (cycle: { startedAt: number; endedAt: number }) => void,
+    ) => {
+      suspendHandler = handler;
+      return vi.fn();
+    },
     adapterStore: {
       getAdapter: () => undefined,
       setAdapter: vi.fn(),
@@ -130,6 +139,8 @@ function createHarness({
     track,
     emitRendererClosing: (closedAt: number) =>
       rendererClosingHandler?.(closedAt),
+    emitSuspend: (startedAt: number, endedAt: number) =>
+      suspendHandler?.({ startedAt, endedAt }),
   };
 }
 
@@ -480,6 +491,31 @@ describe("SessionService run-less local task recovery", () => {
     await reconnectToLocalSession(secondReopen.service, task, rawEntries);
 
     expect(secondReopen.sessions["run-task-1"].pausedDurationMs).toBe(30_000);
+  });
+
+  it("persists suspended time when the renderer closes before another event", () => {
+    const {
+      sessions,
+      persistedPromptTimings,
+      emitRendererClosing,
+      emitSuspend,
+    } = createHarness();
+    sessions["run-task-1"] = {
+      ...makeSession("task-1"),
+      isPromptPending: true,
+      promptStartedAt: 1_000,
+      currentPromptId: 1,
+    };
+
+    emitSuspend(5_000, 20_000);
+    emitRendererClosing(21_000);
+
+    expect(persistedPromptTimings["run-task-1"]).toEqual({
+      promptId: 1,
+      promptStartedAt: 1_000,
+      pausedDurationMs: 15_000,
+      rendererClosedAt: 21_000,
+    });
   });
 
   it("reports a failed reconnect with the startup step that failed", async () => {

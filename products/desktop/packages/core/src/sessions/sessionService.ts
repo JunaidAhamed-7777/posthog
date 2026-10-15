@@ -3206,8 +3206,11 @@ export class SessionService {
 
   private handleRendererClosing(closedAt: number): void {
     this.flushSessionEvents();
-    for (const session of Object.values(this.d.store.getSessions())) {
+    for (const taskRunId of Object.keys(this.d.store.getSessions())) {
+      this.applyDeferredLocalSuspend({ taskRunId, timestamp: closedAt });
+      const session = this.d.store.getSessions()[taskRunId];
       if (
+        !session ||
         session.isCloud ||
         session.status !== "connected" ||
         !session.isPromptPending ||
@@ -3217,7 +3220,7 @@ export class SessionService {
       ) {
         continue;
       }
-      this.d.setPersistedPromptTiming?.(session.taskRunId, {
+      this.d.setPersistedPromptTiming?.(taskRunId, {
         promptId: session.currentPromptId ?? null,
         promptStartedAt: session.promptStartedAt,
         pausedDurationMs: session.pausedDurationMs ?? 0,
