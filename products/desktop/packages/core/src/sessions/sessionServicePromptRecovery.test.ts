@@ -5,6 +5,39 @@ import { SessionService, type SessionServiceDeps } from "./sessionService";
 const TASK_ID = "task-1";
 const TASK_RUN_ID = `run-${TASK_ID}`;
 
+interface Handlers {
+  onData: (payload: unknown) => void;
+}
+
+function fakeSubscription() {
+  const subscriptions: { handlers: Handlers }[] = [];
+  return {
+    subscriptions,
+    subscribe: vi.fn((_input: unknown, handlers: Handlers) => {
+      subscriptions.push({ handlers });
+      return { unsubscribe: vi.fn() };
+    }),
+  };
+}
+
+function agentChunk(timestamp: number) {
+  return {
+    type: "acp_message",
+    ts: timestamp,
+    message: {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: TASK_RUN_ID,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "still working" },
+        },
+      },
+    },
+  };
+}
+
 function makeSession(): AgentSession {
   return {
     taskRunId: TASK_RUN_ID,
@@ -43,10 +76,21 @@ function createHarness() {
     clearOptimisticItems: vi.fn(),
   };
   const promptMutate = vi.fn();
+  const events = fakeSubscription();
+  const permissions = fakeSubscription();
   const usageLimitShow = vi.fn();
+  let suspendHandler:
+    | ((cycle: { startedAt: number; endedAt: number }) => void)
+    | undefined;
   const deps = {
     store,
     h: { extractSkillButtonId: () => undefined },
+    subscribeToSystemSuspend: (
+      handler: (cycle: { startedAt: number; endedAt: number }) => void,
+    ) => {
+      suspendHandler = handler;
+      return vi.fn();
+    },
     log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     toast: { error: vi.fn(), info: vi.fn() },
     track: vi.fn(),
@@ -57,6 +101,8 @@ function createHarness() {
       agent: {
         prompt: { mutate: promptMutate },
         cancel: { mutate: vi.fn().mockResolvedValue(undefined) },
+        onSessionEvent: { subscribe: events.subscribe },
+        onPermissionRequest: { subscribe: permissions.subscribe },
         onSessionIdleKilled: {
           subscribe: () => ({ unsubscribe: vi.fn() }),
         },
@@ -65,6 +111,9 @@ function createHarness() {
   } as unknown as SessionServiceDeps;
 
   const service = new SessionService(deps);
+  (
+    service as unknown as { subscribeToChannel(taskRunId: string): void }
+  ).subscribeToChannel(TASK_RUN_ID);
   const recoverSpy = vi.spyOn(
     service as unknown as {
       tryAutoRecoverLocalSession: (
@@ -75,12 +124,59 @@ function createHarness() {
     },
     "tryAutoRecoverLocalSession",
   );
-  return { service, sessions, store, promptMutate, recoverSpy, usageLimitShow };
+  return {
+    service,
+    sessions,
+    store,
+    promptMutate,
+    recoverSpy,
+    usageLimitShow,
+    events,
+    emitSuspend: (startedAt: number, endedAt: number) =>
+      suspendHandler?.({ startedAt, endedAt }),
+  };
 }
 
 type RecoverSpy = ReturnType<typeof createHarness>["recoverSpy"];
 
 describe("SessionService prompt recovery on fatal session errors", () => {
+  it.each(["resolve", "reject"] as const)(
+    "records suspended time before a prompt mutation can %s and clear pending state",
+    async (outcome) => {
+      vi.useFakeTimers();
+      try {
+        const { service, sessions, promptMutate, events, emitSuspend } =
+          createHarness();
+        let resolveMutation: (result: { stopReason: string }) => void = () =>
+          undefined;
+        let rejectMutation: (error: Error) => void = () => undefined;
+        promptMutate.mockReturnValue(
+          new Promise((resolve, reject) => {
+            resolveMutation = resolve;
+            rejectMutation = reject;
+          }),
+        );
+
+        const startedAt = Date.now();
+        const result = service.sendPrompt(TASK_ID, "hello again");
+        vi.setSystemTime(startedAt + 2 * 60 * 60_000);
+        emitSuspend(startedAt, Date.now());
+        events.subscriptions[0].handlers.onData(agentChunk(startedAt));
+        if (outcome === "resolve") {
+          resolveMutation({ stopReason: "end_turn" });
+          await expect(result).resolves.toEqual({ stopReason: "end_turn" });
+        } else {
+          rejectMutation(new Error("provider failed"));
+          await expect(result).rejects.toThrow("provider failed");
+        }
+
+        expect(sessions[TASK_RUN_ID].pausedDurationMs).toBe(2 * 60 * 60_000);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it("recovers the session and resends the prompt once", async () => {
     const { service, promptMutate, recoverSpy } = createHarness();
     promptMutate
@@ -149,6 +245,36 @@ describe("SessionService prompt recovery on fatal session errors", () => {
       expect(promptMutate).toHaveBeenCalledTimes(1);
       expect(recoverSpy).not.toHaveBeenCalled();
       expect(usageLimitShow).not.toHaveBeenCalled();
+      expect(sessions[TASK_RUN_ID]).toMatchObject({
+        status: "connected",
+        isPromptPending: false,
+        isCompacting: false,
+        promptStartedAt: null,
+      });
+    },
+  );
+
+  it.each(["message", "details"] as const)(
+    "surfaces a request rejection in %s without restarting the session",
+    async (location) => {
+      const { service, sessions, promptMutate, recoverSpy } = createHarness();
+      const message = "API Error: 400 invalid_request_error";
+      const error =
+        location === "message"
+          ? new Error(`Internal error: ${message}`)
+          : Object.assign(new Error("Internal error"), {
+              data: { details: message },
+            });
+      promptMutate.mockRejectedValue(error);
+
+      await expect(
+        service.sendPrompt(TASK_ID, "keep this message"),
+      ).rejects.toThrow(
+        "The AI provider couldn't process this request. Try starting a new task.",
+      );
+
+      expect(promptMutate).toHaveBeenCalledTimes(1);
+      expect(recoverSpy).not.toHaveBeenCalled();
       expect(sessions[TASK_RUN_ID]).toMatchObject({
         status: "connected",
         isPromptPending: false,

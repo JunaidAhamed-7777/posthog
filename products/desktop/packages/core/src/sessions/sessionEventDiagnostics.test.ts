@@ -38,26 +38,50 @@ function createHarness(sessionOverrides: Partial<AgentSession> = {}) {
   };
   const events = fakeSubscription();
   const permissions = fakeSubscription();
+  let suspendHandler:
+    | ((cycle: { startedAt: number; endedAt: number }) => void)
+    | undefined;
   const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const deps = {
     store: {
       getSessions: () => sessions,
       getSessionByTaskId: (taskId: string) =>
         Object.values(sessions).find((s) => s.taskId === taskId),
-      updateSession: vi.fn(),
+      updateSession: vi.fn(
+        (taskRunId: string, updates: Partial<AgentSession>) => {
+          Object.assign(sessions[taskRunId], updates);
+        },
+      ),
       appendEvents: vi.fn(),
       replaceOptimisticWithEvent: vi.fn(),
-      setPendingPermissions: vi.fn(),
+      setPendingPermissions: vi.fn(
+        (
+          taskRunId: string,
+          pendingPermissions: AgentSession["pendingPermissions"],
+        ) => {
+          sessions[taskRunId].pendingPermissions = pendingPermissions;
+        },
+      ),
       clearMessageQueue: vi.fn(),
       clearTailOptimisticItems: vi.fn(),
       appendOptimisticItem: vi.fn(),
     },
     log,
+    subscribeToSystemSuspend: (
+      handler: (cycle: { startedAt: number; endedAt: number }) => void,
+    ) => {
+      suspendHandler = handler;
+      return vi.fn();
+    },
     getIsOnline: () => true,
     notifyAgentSession: vi.fn(),
     enqueueSpeech: vi.fn(),
+    taskViewedApi: { markActivity: vi.fn() },
+    track: vi.fn(),
+    buildPermissionToolMetadata: vi.fn(() => ({})),
     trpc: {
       agent: {
+        respondToPermission: { mutate: vi.fn().mockResolvedValue(undefined) },
         onSessionEvent: { subscribe: events.subscribe },
         onPermissionRequest: { subscribe: permissions.subscribe },
         onSessionIdleKilled: { subscribe: () => ({ unsubscribe: vi.fn() }) },
@@ -68,7 +92,16 @@ function createHarness(sessionOverrides: Partial<AgentSession> = {}) {
   (
     service as unknown as { subscribeToChannel(taskRunId: string): void }
   ).subscribeToChannel(RUN_ID);
-  return { service, events, permissions, log, deps };
+  return {
+    service,
+    sessions,
+    events,
+    permissions,
+    log,
+    deps,
+    emitSuspend: (startedAt: number, endedAt: number) =>
+      suspendHandler?.({ startedAt, endedAt }),
+  };
 }
 
 describe("session event diagnostics", () => {
@@ -131,6 +164,25 @@ describe("session event diagnostics", () => {
         },
       },
     };
+    const completion = (ts: number) => ({
+      type: "acp_message",
+      ts,
+      message: {
+        jsonrpc: "2.0",
+        id: 1,
+        result: { stopReason: "end_turn" },
+      },
+    });
+    const promptEcho = (ts: number, id = 1) => ({
+      type: "acp_message",
+      ts,
+      message: {
+        jsonrpc: "2.0",
+        id,
+        method: "session/prompt",
+        params: { sessionId: RUN_ID, prompt: [{ type: "text", text: "go" }] },
+      },
+    });
 
     it.each([
       {
@@ -177,5 +229,419 @@ describe("session event diagnostics", () => {
         vi.useRealTimers();
       }
     });
+
+    it.each([
+      {
+        name: "records an explicit suspend before the completion event is applied",
+        clockJumpMs: 2 * 60 * 60_000,
+        suspendCycle: true,
+        eventAfterJump: true,
+        staleEventAfterJump: false,
+        expectedPausedMs: 2 * 60 * 60_000,
+      },
+      {
+        name: "ignores normal timer throttling",
+        clockJumpMs: 60_000,
+        suspendCycle: false,
+        eventAfterJump: true,
+        staleEventAfterJump: false,
+        expectedPausedMs: null,
+      },
+      {
+        name: "does not pause a turn that completed before suspend",
+        clockJumpMs: 2 * 60 * 60_000,
+        suspendCycle: true,
+        eventAfterJump: false,
+        staleEventAfterJump: false,
+        expectedPausedMs: null,
+      },
+      {
+        name: "does not treat a long renderer stall as suspended time",
+        clockJumpMs: 2 * 60 * 60_000,
+        suspendCycle: false,
+        eventAfterJump: true,
+        staleEventAfterJump: false,
+        expectedPausedMs: null,
+      },
+      {
+        name: "defers a suspend when a stale chunk precedes a fresh completion",
+        clockJumpMs: 2 * 60 * 60_000,
+        suspendCycle: true,
+        eventAfterJump: true,
+        staleEventAfterJump: true,
+        expectedPausedMs: 2 * 60 * 60_000,
+      },
+      {
+        name: "does not treat a Windows renderer stall as suspended time",
+        clockJumpMs: 2 * 60 * 60_000,
+        suspendCycle: false,
+        eventAfterJump: true,
+        staleEventAfterJump: false,
+        expectedPausedMs: null,
+      },
+    ])("$name", (scenario) => {
+      const { clockJumpMs, suspendCycle, eventAfterJump, expectedPausedMs } =
+        scenario;
+      vi.useFakeTimers();
+      try {
+        const beforeJump = Date.now();
+        const { events, deps, service, emitSuspend } = createHarness({
+          isPromptPending: true,
+          promptStartedAt: beforeJump,
+          pausedDurationMs: 0,
+          currentPromptId: 1,
+        });
+        events.subscriptions[0].handlers.onData(chunk);
+        const updateSession = deps.store.updateSession as ReturnType<
+          typeof vi.fn
+        >;
+        updateSession.mockClear();
+
+        if (!eventAfterJump) {
+          events.subscriptions[0].handlers.onData(completion(beforeJump));
+        }
+        vi.setSystemTime(beforeJump + clockJumpMs);
+        if (suspendCycle) {
+          emitSuspend(beforeJump, beforeJump + clockJumpMs);
+        }
+        if (scenario.staleEventAfterJump) {
+          events.subscriptions[0].handlers.onData({
+            ...chunk,
+            ts: beforeJump,
+          });
+        }
+        if (eventAfterJump) {
+          events.subscriptions[0].handlers.onData(completion(Date.now()));
+        }
+        vi.advanceTimersByTime(20);
+
+        const pauseUpdates = updateSession.mock.calls.filter(
+          ([, patch]) => "pausedDurationMs" in patch,
+        );
+        expect(pauseUpdates).toEqual(
+          expectedPausedMs === null
+            ? []
+            : [[RUN_ID, { pausedDurationMs: expectedPausedMs }]],
+        );
+        expect(updateSession).toHaveBeenCalledWith(RUN_ID, {
+          isPromptPending: false,
+          promptStartedAt: null,
+          currentPromptId: null,
+        });
+        if (expectedPausedMs !== null) {
+          expect(updateSession.mock.calls[0]).toEqual([
+            RUN_ID,
+            { pausedDurationMs: expectedPausedMs },
+          ]);
+        }
+        service.reset();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("flushes another run's completion before attributing suspended time", () => {
+      vi.useFakeTimers();
+      try {
+        const beforeJump = Date.now();
+        const { service, sessions, events, deps, emitSuspend } = createHarness({
+          isPromptPending: true,
+          promptStartedAt: beforeJump,
+          pausedDurationMs: 0,
+          currentPromptId: 1,
+        });
+        const otherRunId = "run-2";
+        sessions[otherRunId] = {
+          ...sessions[RUN_ID],
+          taskRunId: otherRunId,
+          taskId: "task-2",
+        };
+        (
+          service as unknown as {
+            subscribeToChannel(taskRunId: string): void;
+          }
+        ).subscribeToChannel(otherRunId);
+        events.subscriptions[0].handlers.onData({ ...chunk, ts: beforeJump });
+        vi.advanceTimersByTime(20);
+        events.subscriptions[1].handlers.onData(completion(beforeJump));
+
+        vi.setSystemTime(beforeJump + 2 * 60 * 60_000);
+        emitSuspend(beforeJump, Date.now());
+        events.subscriptions[0].handlers.onData({
+          ...chunk,
+          ts: Date.now(),
+        });
+
+        expect(sessions[otherRunId].isPromptPending).toBe(false);
+        expect(
+          (
+            deps.store.updateSession as ReturnType<typeof vi.fn>
+          ).mock.calls.some(
+            ([taskRunId, patch]) =>
+              taskRunId === otherRunId && "pausedDurationMs" in patch,
+          ),
+        ).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("waits for every pending run's first post-suspend event before attributing sleep", () => {
+      vi.useFakeTimers();
+      try {
+        const beforeJump = Date.now();
+        const { service, sessions, events, emitSuspend } = createHarness({
+          isPromptPending: true,
+          promptStartedAt: beforeJump,
+          pausedDurationMs: 0,
+          currentPromptId: 1,
+        });
+        const otherRunId = "run-2";
+        sessions[otherRunId] = {
+          ...sessions[RUN_ID],
+          taskRunId: otherRunId,
+          taskId: "task-2",
+        };
+        (
+          service as unknown as {
+            subscribeToChannel(taskRunId: string): void;
+          }
+        ).subscribeToChannel(otherRunId);
+        events.subscriptions[0].handlers.onData({
+          ...chunk,
+          ts: beforeJump,
+        });
+        events.subscriptions[1].handlers.onData({
+          ...chunk,
+          ts: beforeJump,
+        });
+        vi.advanceTimersByTime(20);
+
+        vi.setSystemTime(beforeJump + 2 * 60 * 60_000);
+        emitSuspend(beforeJump, Date.now());
+        events.subscriptions[0].handlers.onData({
+          ...chunk,
+          ts: Date.now(),
+        });
+        events.subscriptions[1].handlers.onData(completion(beforeJump));
+        vi.advanceTimersByTime(20);
+
+        expect(sessions[otherRunId].pausedDurationMs).toBe(0);
+        service.reset();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("preserves suspended time when the live prompt echo arrives", () => {
+      vi.useFakeTimers();
+      try {
+        const beforeJump = Date.now();
+        const { service, sessions, events, emitSuspend } = createHarness({
+          isPromptPending: true,
+          promptStartedAt: beforeJump,
+          pausedDurationMs: 0,
+        });
+        events.subscriptions[0].handlers.onData({ ...chunk, ts: beforeJump });
+        vi.advanceTimersByTime(20);
+
+        vi.setSystemTime(beforeJump + 2 * 60 * 60_000);
+        emitSuspend(beforeJump, Date.now());
+        events.subscriptions[0].handlers.onData(promptEcho(Date.now()));
+        vi.advanceTimersByTime(20);
+
+        expect(sessions[RUN_ID]).toMatchObject({
+          promptStartedAt: beforeJump,
+          pausedDurationMs: 2 * 60 * 60_000,
+        });
+        service.reset();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not attach live prompt timing to an echo from a different turn", () => {
+      vi.useFakeTimers();
+      try {
+        const currentPromptStartedAt = Date.now();
+        const { service, sessions, events } = createHarness({
+          isPromptPending: true,
+          promptStartedAt: currentPromptStartedAt,
+          pausedDurationMs: 45_000,
+          currentPromptId: 2,
+        });
+
+        events.subscriptions[0].handlers.onData(
+          promptEcho(currentPromptStartedAt - 1_000, 1),
+        );
+        vi.advanceTimersByTime(20);
+
+        expect(sessions[RUN_ID]).toMatchObject({
+          currentPromptId: 2,
+          promptStartedAt: currentPromptStartedAt,
+          pausedDurationMs: 45_000,
+        });
+        service.reset();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not carry a completed turn's deferred suspend into the next turn", () => {
+      vi.useFakeTimers();
+      try {
+        const beforeSuspend = Date.now();
+        const { service, sessions, events, emitSuspend } = createHarness({
+          isPromptPending: true,
+          promptStartedAt: beforeSuspend - 1_000,
+          pausedDurationMs: 0,
+          currentPromptId: 1,
+        });
+
+        vi.setSystemTime(beforeSuspend + 2 * 60 * 60_000);
+        emitSuspend(beforeSuspend, Date.now());
+        events.subscriptions[0].handlers.onData(completion(beforeSuspend - 1));
+        vi.advanceTimersByTime(20);
+
+        Object.assign(sessions[RUN_ID], {
+          isPromptPending: true,
+          promptStartedAt: Date.now(),
+          pausedDurationMs: 0,
+          currentPromptId: null,
+        });
+        events.subscriptions[0].handlers.onData(promptEcho(Date.now(), 2));
+        vi.advanceTimersByTime(20);
+
+        expect(sessions[RUN_ID].pausedDurationMs).toBe(0);
+        service.reset();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it.each([
+      {
+        name: "local turns",
+        isCloud: false,
+        settlesBeforeResponse: false,
+        expectedPausedMs: 2 * 60 * 60_000 + 5 * 60_000,
+      },
+      {
+        name: "cloud turns",
+        isCloud: true,
+        settlesBeforeResponse: false,
+        expectedPausedMs: 5 * 60_000,
+      },
+      {
+        name: "settled local turns",
+        isCloud: false,
+        settlesBeforeResponse: true,
+        expectedPausedMs: 2 * 60 * 60_000 + 5 * 60_000,
+      },
+      {
+        name: "settled cloud turns",
+        isCloud: true,
+        settlesBeforeResponse: true,
+        expectedPausedMs: 5 * 60_000,
+      },
+    ])(
+      "counts suspended and permission-wait time exactly once for $name",
+      async ({ isCloud, settlesBeforeResponse, expectedPausedMs }) => {
+        vi.useFakeTimers();
+        try {
+          const beforeJump = Date.now();
+          const { service, sessions, events, permissions, emitSuspend } =
+            createHarness({
+              isCloud,
+              isPromptPending: true,
+              promptStartedAt: beforeJump,
+              pausedDurationMs: 0,
+              currentPromptId: 1,
+            });
+          events.subscriptions[0].handlers.onData({ ...chunk, ts: beforeJump });
+          vi.advanceTimersByTime(20);
+
+          vi.setSystemTime(beforeJump + 2 * 60 * 60_000);
+          emitSuspend(beforeJump, Date.now());
+          permissions.subscriptions[0].handlers.onData({
+            taskRunId: RUN_ID,
+            toolCall: { toolCallId: "tool-1", title: "Run command" },
+            options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+          });
+          if (settlesBeforeResponse) {
+            Object.assign(sessions[RUN_ID], {
+              isPromptPending: false,
+              promptStartedAt: null,
+            });
+          }
+
+          vi.setSystemTime(Date.now() + 5 * 60_000);
+          await service.respondToPermission("task-1", "tool-1", "allow");
+          events.subscriptions[0].handlers.onData({
+            ...chunk,
+            ts: Date.now(),
+          });
+          vi.advanceTimersByTime(20);
+
+          expect(sessions[RUN_ID].pausedDurationMs).toBe(expectedPausedMs);
+          service.reset();
+        } finally {
+          vi.useRealTimers();
+        }
+      },
+    );
+
+    it("keeps checking silence while a pending session reconnects", () => {
+      vi.useFakeTimers();
+      try {
+        const { service, sessions, events, log } = createHarness({
+          status: "connecting",
+          isPromptPending: true,
+          promptStartedAt: Date.now(),
+        });
+        events.subscriptions[0].handlers.onData({
+          ...chunk,
+          ts: Date.now(),
+        });
+
+        vi.advanceTimersByTime(30_000);
+        sessions[RUN_ID].status = "connected";
+        vi.advanceTimersByTime(60_000);
+
+        expect(log.warn).toHaveBeenCalledWith(
+          "Local session silent while a prompt is pending",
+          expect.objectContaining({ taskRunId: RUN_ID }),
+        );
+        service.reset();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it.each(["disconnected", "error"] as const)(
+      "stops the silence timer for a terminal local session with %s status",
+      (status) => {
+        vi.useFakeTimers();
+        try {
+          const { service, events } = createHarness({
+            status,
+            isPromptPending: true,
+            promptStartedAt: Date.now(),
+          });
+          events.subscriptions[0].handlers.onData({
+            ...chunk,
+            ts: Date.now(),
+          });
+          vi.advanceTimersByTime(20);
+          vi.advanceTimersByTime(30_000);
+          const remainingTimerCount = vi.getTimerCount();
+
+          expect(remainingTimerCount).toBe(0);
+          service.reset();
+        } finally {
+          vi.useRealTimers();
+        }
+      },
+    );
   });
 });

@@ -21,4 +21,10 @@ export const sleepRouter = router({
     .query(({ ctx }) =>
       ctx.container.get<SleepService>(SLEEP_SERVICE).hasBuiltInBattery(),
     ),
+
+  onSuspendCycle: publicProcedure.subscription(async function* (opts) {
+    yield* opts.ctx.container
+      .get<SleepService>(SLEEP_SERVICE)
+      .watchSuspendCycles(opts.signal);
+  }),
 });

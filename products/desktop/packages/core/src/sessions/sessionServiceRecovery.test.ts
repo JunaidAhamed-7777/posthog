@@ -3,6 +3,7 @@ import { ANALYTICS_EVENTS } from "@posthog/shared/analytics-events";
 import type { Task } from "@posthog/shared/domain-types";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  type PersistedPromptTiming,
   type ReconcileTaskConnectionParams,
   SessionService,
   type SessionServiceDeps,
@@ -39,8 +40,22 @@ function makeTask(overrides: Partial<Task> = {}): Task {
   } as Task;
 }
 
-function createHarness({ spyConnect = true } = {}) {
+function createHarness({
+  spyConnect = true,
+  persistedPromptTimings = {},
+  rendererStartedAtMs = 0,
+  rendererLifecycleId = "renderer",
+}: {
+  spyConnect?: boolean;
+  persistedPromptTimings?: Record<string, PersistedPromptTiming>;
+  rendererStartedAtMs?: number;
+  rendererLifecycleId?: string;
+} = {}) {
   const sessions: Record<string, AgentSession> = {};
+  let rendererClosingHandler: ((closedAt: number) => void) | undefined;
+  let suspendHandler:
+    | ((cycle: { startedAt: number; endedAt: number }) => void)
+    | undefined;
   const store = {
     getSessions: () => sessions,
     getSessionByTaskId: (taskId: string) =>
@@ -66,6 +81,29 @@ function createHarness({ spyConnect = true } = {}) {
     getPersistedConfigOptions: () => undefined,
     setPersistedConfigOptions: vi.fn(),
     removePersistedConfigOptions: vi.fn(),
+    getPersistedPromptTiming: (taskRunId: string) =>
+      persistedPromptTimings[taskRunId],
+    setPersistedPromptTiming: (
+      taskRunId: string,
+      timing: PersistedPromptTiming,
+    ) => {
+      persistedPromptTimings[taskRunId] = timing;
+    },
+    removePersistedPromptTiming: (taskRunId: string) => {
+      delete persistedPromptTimings[taskRunId];
+    },
+    rendererStartedAtMs,
+    rendererLifecycleId,
+    subscribeToRendererClosing: (handler: (closedAt: number) => void) => {
+      rendererClosingHandler = handler;
+      return vi.fn();
+    },
+    subscribeToSystemSuspend: (
+      handler: (cycle: { startedAt: number; endedAt: number }) => void,
+    ) => {
+      suspendHandler = handler;
+      return vi.fn();
+    },
     adapterStore: {
       getAdapter: () => undefined,
       setAdapter: vi.fn(),
@@ -93,7 +131,20 @@ function createHarness({ spyConnect = true } = {}) {
   const connectToTask = spyConnect
     ? vi.spyOn(service, "connectToTask").mockResolvedValue(undefined)
     : undefined;
-  return { service, sessions, connectToTask, log, store, reconnect, track };
+  return {
+    service,
+    sessions,
+    persistedPromptTimings,
+    connectToTask,
+    log,
+    store,
+    reconnect,
+    track,
+    emitRendererClosing: (closedAt: number) =>
+      rendererClosingHandler?.(closedAt),
+    emitSuspend: (startedAt: number, endedAt: number) =>
+      suspendHandler?.({ startedAt, endedAt }),
+  };
 }
 
 function reconnectToLocalSession(
@@ -252,6 +303,7 @@ describe("SessionService run-less local task recovery", () => {
       isPromptPending: true,
       promptStartedAt: 1,
       currentPromptId: 1,
+      pausedDurationMs: 45_000,
     };
     const rawEntries: StoredLogEntry[] = [
       {
@@ -279,6 +331,272 @@ describe("SessionService run-less local task recovery", () => {
       isPromptPending: false,
       promptStartedAt: null,
       currentPromptId: null,
+      pausedDurationMs: 45_000,
+    });
+  });
+
+  it("does not restore paused timing onto a different prompt during reconnect", async () => {
+    const { service, sessions } = createHarness({
+      spyConnect: false,
+      persistedPromptTimings: {
+        "run-task-1": {
+          promptId: null,
+          promptStartedAt: 3,
+          pausedDurationMs: 30_000,
+        },
+      },
+    });
+    const task = makeTask();
+    sessions["run-task-1"] = {
+      ...makeSession(task.id),
+      isPromptPending: true,
+      promptStartedAt: 3,
+      currentPromptId: 2,
+      pausedDurationMs: 45_000,
+    };
+    const rawEntries: StoredLogEntry[] = [
+      {
+        type: "notification",
+        timestamp: new Date(1).toISOString(),
+        notification: {
+          id: 1,
+          method: "session/prompt",
+          params: { prompt: [{ type: "text", text: "Earlier prompt" }] },
+        },
+      },
+      {
+        type: "notification",
+        timestamp: new Date(2).toISOString(),
+        notification: {
+          id: 1,
+          result: { stopReason: "end_turn" },
+        },
+      },
+    ];
+
+    await reconnectToLocalSession(service, task, rawEntries);
+
+    expect(sessions["run-task-1"].pausedDurationMs).toBe(0);
+  });
+
+  it("restores a completed prompt's persisted timing after a renderer reload", async () => {
+    const { service, sessions, persistedPromptTimings } = createHarness({
+      spyConnect: false,
+    });
+    const task = makeTask();
+    persistedPromptTimings["run-task-1"] = {
+      promptId: 1,
+      promptStartedAt: 1,
+      pausedDurationMs: 45_000,
+    };
+    const rawEntries: StoredLogEntry[] = [
+      {
+        type: "notification",
+        timestamp: new Date(1).toISOString(),
+        notification: {
+          id: 1,
+          method: "session/prompt",
+          params: { prompt: [{ type: "text", text: "Ship the fix" }] },
+        },
+      },
+      {
+        type: "notification",
+        timestamp: new Date(2).toISOString(),
+        notification: {
+          id: 1,
+          result: { stopReason: "end_turn" },
+        },
+      },
+    ];
+
+    await reconnectToLocalSession(service, task, rawEntries);
+
+    expect(sessions["run-task-1"]).toMatchObject({
+      isPromptPending: false,
+      promptStartedAt: null,
+      currentPromptId: null,
+      pausedDurationMs: 45_000,
+    });
+  });
+
+  it("keeps app-closed prompt downtime after a second completed-turn reload", async () => {
+    const task = makeTask();
+    const persistedPromptTimings: Record<string, PersistedPromptTiming> = {
+      "run-task-1": {
+        promptId: null,
+        promptStartedAt: 1_000,
+        pausedDurationMs: 0,
+      },
+    };
+    const firstRenderer = createHarness({
+      spyConnect: false,
+      persistedPromptTimings,
+      rendererStartedAtMs: 0,
+      rendererLifecycleId: "before-restart",
+    });
+    firstRenderer.sessions["run-task-1"] = {
+      ...makeSession(task.id),
+      isPromptPending: true,
+      promptStartedAt: 1_000,
+      currentPromptId: null,
+    };
+
+    firstRenderer.emitRendererClosing(20_000);
+    firstRenderer.service.reset();
+
+    const rawEntries: StoredLogEntry[] = [
+      {
+        type: "notification",
+        timestamp: new Date(1_000).toISOString(),
+        notification: {
+          id: 1,
+          method: "session/prompt",
+          params: { prompt: [{ type: "text", text: "Keep working" }] },
+        },
+      },
+      {
+        type: "notification",
+        timestamp: new Date(10_000).toISOString(),
+        notification: {
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "Working" },
+            },
+          },
+        },
+      },
+      {
+        type: "notification",
+        timestamp: new Date(50_000).toISOString(),
+        notification: {
+          id: 1,
+          result: { stopReason: "end_turn" },
+        },
+      },
+    ];
+    const firstReopen = createHarness({
+      spyConnect: false,
+      persistedPromptTimings,
+      rendererStartedAtMs: 60_000,
+      rendererLifecycleId: "after-restart",
+    });
+
+    await reconnectToLocalSession(firstReopen.service, task, rawEntries);
+    expect(firstReopen.sessions["run-task-1"].pausedDurationMs).toBe(30_000);
+    expect(persistedPromptTimings["run-task-1"].promptId).toBe(1);
+    firstReopen.service.reset();
+
+    const secondReopen = createHarness({
+      spyConnect: false,
+      persistedPromptTimings,
+      rendererStartedAtMs: 70_000,
+      rendererLifecycleId: "after-restart",
+    });
+    await reconnectToLocalSession(secondReopen.service, task, rawEntries);
+
+    expect(secondReopen.sessions["run-task-1"].pausedDurationMs).toBe(30_000);
+  });
+
+  it("keeps generation time across a renderer reload in the same app process", async () => {
+    const task = makeTask();
+    const persistedPromptTimings: Record<string, PersistedPromptTiming> = {
+      "run-task-1": {
+        promptId: 1,
+        promptStartedAt: 1_000,
+        pausedDurationMs: 0,
+        rendererClosedAt: 20_000,
+        rendererLifecycleId: "same-app",
+      },
+    };
+    const rawEntries: StoredLogEntry[] = [
+      {
+        type: "notification",
+        timestamp: new Date(1_000).toISOString(),
+        notification: {
+          id: 1,
+          method: "session/prompt",
+          params: { prompt: [{ type: "text", text: "Keep working" }] },
+        },
+      },
+      {
+        type: "notification",
+        timestamp: new Date(50_000).toISOString(),
+        notification: {
+          id: 1,
+          result: { stopReason: "end_turn" },
+        },
+      },
+    ];
+    const reloaded = createHarness({
+      spyConnect: false,
+      persistedPromptTimings,
+      rendererStartedAtMs: 30_000,
+      rendererLifecycleId: "same-app",
+    });
+
+    await reconnectToLocalSession(reloaded.service, task, rawEntries);
+
+    expect(reloaded.sessions["run-task-1"].pausedDurationMs).toBe(0);
+  });
+
+  it("persists suspended time when the renderer closes before another event", () => {
+    const {
+      sessions,
+      persistedPromptTimings,
+      emitRendererClosing,
+      emitSuspend,
+    } = createHarness();
+    sessions["run-task-1"] = {
+      ...makeSession("task-1"),
+      isPromptPending: true,
+      promptStartedAt: 1_000,
+      currentPromptId: 1,
+    };
+
+    emitSuspend(5_000, 20_000);
+    emitRendererClosing(21_000);
+
+    expect(persistedPromptTimings["run-task-1"]).toEqual({
+      promptId: 1,
+      promptStartedAt: 1_000,
+      pausedDurationMs: 15_000,
+      rendererClosedAt: 21_000,
+      rendererLifecycleId: "renderer",
+    });
+  });
+
+  it("persists an unresolved permission wait when the renderer closes", () => {
+    const { sessions, persistedPromptTimings, emitRendererClosing } =
+      createHarness();
+    sessions["run-task-1"] = {
+      ...makeSession("task-1"),
+      isPromptPending: true,
+      promptStartedAt: 1_000,
+      currentPromptId: 1,
+      pausedDurationMs: 1_000,
+      pendingPermissions: new Map([
+        [
+          "tool-1",
+          {
+            taskRunId: "run-task-1",
+            toolCall: { toolCallId: "tool-1", title: "Run command" },
+            options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+            receivedAt: 5_000,
+          },
+        ],
+      ]),
+    };
+
+    emitRendererClosing(10_000);
+
+    expect(persistedPromptTimings["run-task-1"]).toEqual({
+      promptId: 1,
+      promptStartedAt: 1_000,
+      pausedDurationMs: 6_000,
+      rendererClosedAt: 10_000,
+      rendererLifecycleId: "renderer",
     });
   });
 

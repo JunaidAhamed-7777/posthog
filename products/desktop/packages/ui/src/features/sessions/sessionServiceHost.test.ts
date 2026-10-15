@@ -201,6 +201,13 @@ vi.mock(
   () => mockSessionConfigStore,
 );
 
+vi.mock("@posthog/ui/features/sessions/sessionTimingStore", () => ({
+  getPersistedPromptTiming: vi.fn(() => undefined),
+  setPersistedPromptTiming: vi.fn(),
+  removePersistedPromptTiming: vi.fn(),
+  waitForPersistedPromptTiming: vi.fn().mockResolvedValue(undefined),
+}));
+
 const mockAdapterFns = vi.hoisted(() => ({
   setAdapter: vi.fn(),
   getAdapter: vi.fn(),
@@ -338,6 +345,11 @@ vi.mock("@posthog/di/container", () => ({
         workspace: mockTrpcWorkspace,
         logs: mockTrpcLogs,
         cloudTask: mockTrpcCloudTask,
+        sleep: {
+          onSuspendCycle: {
+            subscribe: vi.fn(() => ({ unsubscribe: vi.fn() })),
+          },
+        },
         claudeSubscriptionToken: {
           has: { query: vi.fn().mockResolvedValue(true) },
         },
