@@ -567,6 +567,39 @@ describe("SessionService run-less local task recovery", () => {
     });
   });
 
+  it("persists an unresolved permission wait when the renderer closes", () => {
+    const { sessions, persistedPromptTimings, emitRendererClosing } =
+      createHarness();
+    sessions["run-task-1"] = {
+      ...makeSession("task-1"),
+      isPromptPending: true,
+      promptStartedAt: 1_000,
+      currentPromptId: 1,
+      pausedDurationMs: 1_000,
+      pendingPermissions: new Map([
+        [
+          "tool-1",
+          {
+            taskRunId: "run-task-1",
+            toolCall: { toolCallId: "tool-1", title: "Run command" },
+            options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+            receivedAt: 5_000,
+          },
+        ],
+      ]),
+    };
+
+    emitRendererClosing(10_000);
+
+    expect(persistedPromptTimings["run-task-1"]).toEqual({
+      promptId: 1,
+      promptStartedAt: 1_000,
+      pausedDurationMs: 6_000,
+      rendererClosedAt: 10_000,
+      rendererLifecycleId: "renderer",
+    });
+  });
+
   it("reports a failed reconnect with the startup step that failed", async () => {
     const { service, sessions, reconnect, track } = createHarness({
       spyConnect: false,

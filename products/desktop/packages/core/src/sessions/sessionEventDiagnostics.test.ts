@@ -523,16 +523,30 @@ describe("session event diagnostics", () => {
       {
         name: "local turns",
         isCloud: false,
+        settlesBeforeResponse: false,
         expectedPausedMs: 2 * 60 * 60_000 + 5 * 60_000,
       },
       {
         name: "cloud turns",
         isCloud: true,
+        settlesBeforeResponse: false,
+        expectedPausedMs: 5 * 60_000,
+      },
+      {
+        name: "settled local turns",
+        isCloud: false,
+        settlesBeforeResponse: true,
+        expectedPausedMs: 2 * 60 * 60_000 + 5 * 60_000,
+      },
+      {
+        name: "settled cloud turns",
+        isCloud: true,
+        settlesBeforeResponse: true,
         expectedPausedMs: 5 * 60_000,
       },
     ])(
       "counts suspended and permission-wait time exactly once for $name",
-      async ({ isCloud, expectedPausedMs }) => {
+      async ({ isCloud, settlesBeforeResponse, expectedPausedMs }) => {
         vi.useFakeTimers();
         try {
           const beforeJump = Date.now();
@@ -554,6 +568,12 @@ describe("session event diagnostics", () => {
             toolCall: { toolCallId: "tool-1", title: "Run command" },
             options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
           });
+          if (settlesBeforeResponse) {
+            Object.assign(sessions[RUN_ID], {
+              isPromptPending: false,
+              promptStartedAt: null,
+            });
+          }
 
           vi.setSystemTime(Date.now() + 5 * 60_000);
           await service.respondToPermission("task-1", "tool-1", "allow");

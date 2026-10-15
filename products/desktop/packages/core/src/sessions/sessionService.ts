@@ -3226,15 +3226,26 @@ export class SessionService {
         session.status !== "connected" ||
         !session.isPromptPending ||
         session.promptStartedAt === null ||
-        session.pendingPermissions.size > 0 ||
         closedAt <= session.promptStartedAt
       ) {
         continue;
       }
+      const permissionWaitStartedAt = Math.min(
+        ...Array.from(
+          session.pendingPermissions.values(),
+          (permission) => permission.receivedAt ?? Number.POSITIVE_INFINITY,
+        ),
+      );
+      const unresolvedPermissionWaitMs = Number.isFinite(
+        permissionWaitStartedAt,
+      )
+        ? Math.max(0, closedAt - permissionWaitStartedAt)
+        : 0;
       this.d.setPersistedPromptTiming?.(taskRunId, {
         promptId: session.currentPromptId ?? null,
         promptStartedAt: session.promptStartedAt,
-        pausedDurationMs: session.pausedDurationMs ?? 0,
+        pausedDurationMs:
+          (session.pausedDurationMs ?? 0) + unresolvedPermissionWaitMs,
         rendererClosedAt: closedAt,
         rendererLifecycleId: this.d.rendererLifecycleId,
       });
@@ -3273,7 +3284,7 @@ export class SessionService {
   private addPausedDuration(taskRunId: string, durationMs: number): void {
     if (durationMs <= 0) return;
     const session = this.d.store.getSessions()[taskRunId];
-    if (!session || !session.isPromptPending) return;
+    if (!session) return;
     const pausedDurationMs = (session.pausedDurationMs ?? 0) + durationMs;
     this.d.store.updateSession(taskRunId, { pausedDurationMs });
     if (!session.isCloud && session.promptStartedAt !== null) {
@@ -3297,6 +3308,11 @@ export class SessionService {
     this.flushSessionEventsForTask(event.taskRunId);
     deferred = this.deferredLocalSuspends.get(event.taskRunId);
     if (!deferred || event.timestamp <= deferred.latestSuspendStartedAtMs) {
+      return;
+    }
+    const session = this.d.store.getSessions()[event.taskRunId];
+    if (!session || session.isCloud || !session.isPromptPending) {
+      this.deferredLocalSuspends.delete(event.taskRunId);
       return;
     }
     this.deferredLocalSuspends.delete(event.taskRunId);
