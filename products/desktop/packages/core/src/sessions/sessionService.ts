@@ -196,6 +196,7 @@ const MAX_HOST_ENDED_RESUBSCRIBES = 3;
  */
 const LOCAL_SILENCE_WARN_AFTER_MS = 60_000;
 const LOCAL_SILENCE_CHECK_INTERVAL_MS = 30_000;
+const LOCAL_SUSPEND_DETECT_MARGIN_MS = 90_000;
 
 /** Short label for a log line: `session/update:agent_message_chunk`, `response`. */
 function describeAcpMethod(acpMsg: AcpMessage): string {
@@ -1841,6 +1842,7 @@ export class SessionService {
   /** Runs already logged for their current stretch of silence. */
   private silenceLogged = new Set<string>();
   private silenceCheckHandle: ReturnType<typeof setInterval> | null = null;
+  private lastSilenceCheckAt: number | null = null;
   /** Active cloud task watchers, keyed by taskId */
   private cloudTaskWatchers = new Map<string, CloudTaskWatcher>();
   private olderTranscriptLoads = new Set<string>();
@@ -2936,6 +2938,7 @@ export class SessionService {
   private lastAgentTextAt = new Map<string, number>();
 
   private enqueueSessionEvent(taskRunId: string, acpMsg: AcpMessage): void {
+    this.recordLocalSuspend(Date.now());
     this.hostEndedResubscribes.delete(taskRunId);
     this.lastSessionEventAt.set(taskRunId, Date.now());
     this.silenceLogged.delete(taskRunId);
@@ -3020,14 +3023,43 @@ export class SessionService {
 
   private ensureSilenceCheck(): void {
     if (this.silenceCheckHandle !== null) return;
+    this.lastSilenceCheckAt = Date.now();
     this.silenceCheckHandle = setInterval(
       () => this.checkLocalSessionSilence(),
       LOCAL_SILENCE_CHECK_INTERVAL_MS,
     );
   }
 
+  private recordLocalSuspend(now: number): void {
+    if (this.lastSilenceCheckAt === null) return;
+    const elapsedMs = now - this.lastSilenceCheckAt;
+    this.lastSilenceCheckAt = now;
+    const suspendedMs = elapsedMs - LOCAL_SILENCE_CHECK_INTERVAL_MS;
+    if (suspendedMs <= LOCAL_SUSPEND_DETECT_MARGIN_MS) return;
+
+    for (const session of Object.values(this.d.store.getSessions())) {
+      if (
+        session.isCloud ||
+        !session.isPromptPending ||
+        session.pendingPermissions.size > 0
+      ) {
+        continue;
+      }
+      const promptElapsedMs = Math.max(
+        0,
+        now - (session.promptStartedAt ?? now),
+      );
+      this.d.store.updateSession(session.taskRunId, {
+        pausedDurationMs:
+          (session.pausedDurationMs ?? 0) +
+          Math.min(suspendedMs, promptElapsedMs),
+      });
+    }
+  }
+
   private checkLocalSessionSilence(): void {
     const now = Date.now();
+    this.recordLocalSuspend(now);
     let anyPending = false;
     for (const session of Object.values(this.d.store.getSessions())) {
       if (session.isCloud || !session.isPromptPending) continue;
@@ -3060,6 +3092,7 @@ export class SessionService {
     if (!anyPending && this.silenceCheckHandle !== null) {
       clearInterval(this.silenceCheckHandle);
       this.silenceCheckHandle = null;
+      this.lastSilenceCheckAt = null;
     }
   }
 
@@ -3347,6 +3380,7 @@ export class SessionService {
       clearInterval(this.silenceCheckHandle);
       this.silenceCheckHandle = null;
     }
+    this.lastSilenceCheckAt = null;
     for (const timer of this.eventEvictionTimers.values()) clearTimeout(timer);
     this.eventEvictionTimers.clear();
     for (const { timer } of this.connectingToastTimers.values()) {

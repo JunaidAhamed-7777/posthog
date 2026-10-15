@@ -80,7 +80,25 @@ export type ConversationItem =
 export interface LastTurnInfo {
   isComplete: boolean;
   durationMs: number;
+  longestGapMs: number;
   stopReason?: string;
+}
+
+const MAX_UNEXPLAINED_TURN_GAP_MS = 30 * 60_000;
+const PAUSE_MATCH_TOLERANCE_MS = 60_000;
+
+export function lastGenerationDurationMs(
+  info: LastTurnInfo | null,
+  pausedDurationMs: number,
+): number | null {
+  if (!info?.isComplete) return null;
+  if (
+    info.longestGapMs > MAX_UNEXPLAINED_TURN_GAP_MS &&
+    info.longestGapMs - pausedDurationMs > PAUSE_MATCH_TOLERANCE_MS
+  ) {
+    return null;
+  }
+  return Math.max(0, info.durationMs - pausedDurationMs);
 }
 
 export interface BuildResult {
@@ -124,6 +142,8 @@ interface TurnState {
   stopReason?: string;
   interruptReason?: string;
   durationMs: number;
+  lastEventAt: number;
+  longestGapMs: number;
   toolCalls: Map<string, ToolCall>;
   context: TurnContext;
   gitAction: ReturnType<typeof parseGitActionMessage>;
@@ -201,6 +221,11 @@ export function createItemBuilder(): ItemBuilder {
 function noteActivity(b: ItemBuilder, ts: number) {
   if (b.lastActivityAt === null || ts > b.lastActivityAt) {
     b.lastActivityAt = ts;
+  }
+  const turn = b.currentTurn;
+  if (turn && !turn.isComplete && ts > turn.lastEventAt) {
+    turn.longestGapMs = Math.max(turn.longestGapMs, ts - turn.lastEventAt);
+    turn.lastEventAt = ts;
   }
 }
 
@@ -542,6 +567,7 @@ export function readLastTurnInfo(b: ItemBuilder): LastTurnInfo | null {
     ? {
         isComplete: b.currentTurn.isComplete,
         durationMs: b.currentTurn.durationMs,
+        longestGapMs: b.currentTurn.longestGapMs,
         stopReason: b.currentTurn.stopReason,
       }
     : null;
@@ -641,6 +667,8 @@ function handlePromptRequest(
     promptId: msg.id,
     isComplete: false,
     durationMs: -ts,
+    lastEventAt: ts,
+    longestGapMs: 0,
     toolCalls,
     context,
     gitAction,
@@ -1168,6 +1196,8 @@ function ensureImplicitTurn(b: ItemBuilder, ts: number) {
     promptId: -1,
     isComplete: false,
     durationMs: -ts,
+    lastEventAt: ts,
+    longestGapMs: 0,
     toolCalls,
     context,
     gitAction: { isGitAction: false, actionType: null, prompt: "" },
