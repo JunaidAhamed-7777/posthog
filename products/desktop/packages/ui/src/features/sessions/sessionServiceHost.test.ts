@@ -338,6 +338,11 @@ vi.mock("@posthog/di/container", () => ({
         workspace: mockTrpcWorkspace,
         logs: mockTrpcLogs,
         cloudTask: mockTrpcCloudTask,
+        sleep: {
+          onSuspendCycle: {
+            subscribe: vi.fn(() => ({ unsubscribe: vi.fn() })),
+          },
+        },
         claudeSubscriptionToken: {
           has: { query: vi.fn().mockResolvedValue(true) },
         },
