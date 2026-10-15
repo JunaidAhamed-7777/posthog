@@ -165,6 +165,11 @@ vi.mock("@posthog/di/container", () => ({
         logs: mockTrpcLogs,
         cloudTask: mockTrpcCloudTask,
         fs: mockTrpcFs,
+        sleep: {
+          onSuspendCycle: {
+            subscribe: vi.fn(() => ({ unsubscribe: vi.fn() })),
+          },
+        },
       };
     }
     if (token === Symbol.for("posthog.ui.ImperativeQueryClient")) {
