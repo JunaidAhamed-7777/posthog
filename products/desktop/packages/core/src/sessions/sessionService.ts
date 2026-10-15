@@ -2434,8 +2434,8 @@ export class SessionService {
     ].filter((timing): timing is PersistedPromptTiming => timing !== undefined);
     const hydratedSession = this.d.store.getSessions()[taskRunId];
     const matchingTiming = hydratedPrompt
-      ? timingCandidates.find(
-          (timing) => promptTimingMatches(timing, hydratedPrompt),
+      ? timingCandidates.find((timing) =>
+          promptTimingMatches(timing, hydratedPrompt),
         )
       : hydratedSession?.isPromptPending
         ? timingCandidates.find(
