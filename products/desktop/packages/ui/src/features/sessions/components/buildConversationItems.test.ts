@@ -688,9 +688,9 @@ describe("buildConversationItems", () => {
         null,
       );
 
-      expect(
-        lastGenerationDurationMs(lastTurnInfo, pausedDurationMs),
-      ).toBe(expectedDurationMs);
+      expect(lastGenerationDurationMs(lastTurnInfo, pausedDurationMs)).toBe(
+        expectedDurationMs,
+      );
     },
   );
 

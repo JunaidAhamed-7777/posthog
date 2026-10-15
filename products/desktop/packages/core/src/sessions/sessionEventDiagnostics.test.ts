@@ -131,6 +131,15 @@ describe("session event diagnostics", () => {
         },
       },
     };
+    const completion = {
+      type: "acp_message",
+      ts: 2,
+      message: {
+        jsonrpc: "2.0",
+        id: 1,
+        result: { stopReason: "end_turn" },
+      },
+    };
 
     it.each([
       {
@@ -196,6 +205,7 @@ describe("session event diagnostics", () => {
           isPromptPending: true,
           promptStartedAt: Date.now(),
           pausedDurationMs: 0,
+          currentPromptId: 1,
         });
         events.subscriptions[0].handlers.onData(chunk);
         const updateSession = deps.store.updateSession as ReturnType<
@@ -204,7 +214,8 @@ describe("session event diagnostics", () => {
         updateSession.mockClear();
 
         vi.setSystemTime(Date.now() + clockJumpMs);
-        events.subscriptions[0].handlers.onData(chunk);
+        events.subscriptions[0].handlers.onData(completion);
+        vi.advanceTimersByTime(20);
 
         const pauseUpdates = updateSession.mock.calls.filter(
           ([, patch]) => "pausedDurationMs" in patch,
@@ -214,6 +225,17 @@ describe("session event diagnostics", () => {
             ? []
             : [[RUN_ID, { pausedDurationMs: expectedPausedMs }]],
         );
+        expect(updateSession).toHaveBeenCalledWith(RUN_ID, {
+          isPromptPending: false,
+          promptStartedAt: null,
+          currentPromptId: null,
+        });
+        if (expectedPausedMs !== null) {
+          expect(updateSession.mock.calls[0]).toEqual([
+            RUN_ID,
+            { pausedDurationMs: expectedPausedMs },
+          ]);
+        }
         service.reset();
       } finally {
         vi.useRealTimers();
