@@ -3044,6 +3044,7 @@ export class SessionService {
     const { taskId, taskRunId, taskTitle, logUrl } = params;
     const existing = this.d.store.getSessionByTaskId(taskId);
     if (existing && existing.events.length > 0) return;
+    await this.d.waitForPersistedPromptTiming?.();
 
     const { rawEntries } = await this.fetchSessionLogs(logUrl, taskRunId);
     const events = convertStoredEntriesToEvents(rawEntries);
