@@ -21,12 +21,7 @@ function fakeSubscription() {
   };
 }
 
-function createHarness(
-  sessionOverrides: Partial<AgentSession> = {},
-  {
-    activeClockIncludesSystemSuspend = false,
-  }: { activeClockIncludesSystemSuspend?: boolean } = {},
-) {
+function createHarness(sessionOverrides: Partial<AgentSession> = {}) {
   const sessions: Record<string, AgentSession> = {
     [RUN_ID]: {
       taskRunId: RUN_ID,
@@ -43,6 +38,9 @@ function createHarness(
   };
   const events = fakeSubscription();
   const permissions = fakeSubscription();
+  let suspendHandler:
+    | ((cycle: { startedAt: number; endedAt: number }) => void)
+    | undefined;
   const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const deps = {
     store: {
@@ -69,7 +67,12 @@ function createHarness(
       appendOptimisticItem: vi.fn(),
     },
     log,
-    activeClockIncludesSystemSuspend,
+    subscribeToSystemSuspend: (
+      handler: (cycle: { startedAt: number; endedAt: number }) => void,
+    ) => {
+      suspendHandler = handler;
+      return vi.fn();
+    },
     getIsOnline: () => true,
     notifyAgentSession: vi.fn(),
     enqueueSpeech: vi.fn(),
@@ -89,7 +92,16 @@ function createHarness(
   (
     service as unknown as { subscribeToChannel(taskRunId: string): void }
   ).subscribeToChannel(RUN_ID);
-  return { service, sessions, events, permissions, log, deps };
+  return {
+    service,
+    sessions,
+    events,
+    permissions,
+    log,
+    deps,
+    emitSuspend: (startedAt: number, endedAt: number) =>
+      suspendHandler?.({ startedAt, endedAt }),
+  };
 }
 
 describe("session event diagnostics", () => {
@@ -161,12 +173,12 @@ describe("session event diagnostics", () => {
         result: { stopReason: "end_turn" },
       },
     });
-    const promptEcho = (ts: number) => ({
+    const promptEcho = (ts: number, id = 1) => ({
       type: "acp_message",
       ts,
       message: {
         jsonrpc: "2.0",
-        id: 1,
+        id,
         method: "session/prompt",
         params: { sessionId: RUN_ID, prompt: [{ type: "text", text: "go" }] },
       },
@@ -220,10 +232,9 @@ describe("session event diagnostics", () => {
 
     it.each([
       {
-        name: "records a long clock jump before the completion event is applied",
+        name: "records an explicit suspend before the completion event is applied",
         clockJumpMs: 2 * 60 * 60_000,
-        activeClockJumpMs: 0,
-        activeClockIncludesSystemSuspend: false,
+        suspendCycle: true,
         eventAfterJump: true,
         staleEventAfterJump: false,
         expectedPausedMs: 2 * 60 * 60_000,
@@ -231,17 +242,15 @@ describe("session event diagnostics", () => {
       {
         name: "ignores normal timer throttling",
         clockJumpMs: 60_000,
-        activeClockJumpMs: 0,
-        activeClockIncludesSystemSuspend: false,
+        suspendCycle: false,
         eventAfterJump: true,
         staleEventAfterJump: false,
         expectedPausedMs: null,
       },
       {
-        name: "does not pause a turn that completed before the clock jump",
+        name: "does not pause a turn that completed before suspend",
         clockJumpMs: 2 * 60 * 60_000,
-        activeClockJumpMs: 0,
-        activeClockIncludesSystemSuspend: false,
+        suspendCycle: true,
         eventAfterJump: false,
         staleEventAfterJump: false,
         expectedPausedMs: null,
@@ -249,8 +258,7 @@ describe("session event diagnostics", () => {
       {
         name: "does not treat a long renderer stall as suspended time",
         clockJumpMs: 2 * 60 * 60_000,
-        activeClockJumpMs: 2 * 60 * 60_000,
-        activeClockIncludesSystemSuspend: false,
+        suspendCycle: false,
         eventAfterJump: true,
         staleEventAfterJump: false,
         expectedPausedMs: null,
@@ -258,59 +266,53 @@ describe("session event diagnostics", () => {
       {
         name: "defers a suspend when a stale chunk precedes a fresh completion",
         clockJumpMs: 2 * 60 * 60_000,
-        activeClockJumpMs: 0,
-        activeClockIncludesSystemSuspend: false,
+        suspendCycle: true,
         eventAfterJump: true,
         staleEventAfterJump: true,
         expectedPausedMs: 2 * 60 * 60_000,
       },
       {
-        name: "records Windows suspend when the active clock also advances",
+        name: "does not treat a Windows renderer stall as suspended time",
         clockJumpMs: 2 * 60 * 60_000,
-        activeClockJumpMs: 2 * 60 * 60_000,
-        activeClockIncludesSystemSuspend: true,
+        suspendCycle: false,
         eventAfterJump: true,
         staleEventAfterJump: false,
-        expectedPausedMs: 2 * 60 * 60_000 - 30_000,
+        expectedPausedMs: null,
       },
     ])("$name", (scenario) => {
-      const {
-        clockJumpMs,
-        activeClockJumpMs,
-        activeClockIncludesSystemSuspend,
-        eventAfterJump,
-        expectedPausedMs,
-      } = scenario;
+      const { clockJumpMs, suspendCycle, eventAfterJump, expectedPausedMs } =
+        scenario;
       vi.useFakeTimers();
-      const performanceNow = vi.spyOn(performance, "now").mockReturnValue(0);
       try {
         const beforeJump = Date.now();
-        const { events, deps, service } = createHarness(
-          {
-            isPromptPending: true,
-            promptStartedAt: beforeJump,
-            pausedDurationMs: 0,
-            currentPromptId: 1,
-          },
-          { activeClockIncludesSystemSuspend },
-        );
+        const { events, deps, service, emitSuspend } = createHarness({
+          isPromptPending: true,
+          promptStartedAt: beforeJump,
+          pausedDurationMs: 0,
+          currentPromptId: 1,
+        });
         events.subscriptions[0].handlers.onData(chunk);
         const updateSession = deps.store.updateSession as ReturnType<
           typeof vi.fn
         >;
         updateSession.mockClear();
 
+        if (!eventAfterJump) {
+          events.subscriptions[0].handlers.onData(completion(beforeJump));
+        }
         vi.setSystemTime(beforeJump + clockJumpMs);
-        performanceNow.mockReturnValue(activeClockJumpMs);
+        if (suspendCycle) {
+          emitSuspend(beforeJump, beforeJump + clockJumpMs);
+        }
         if (scenario.staleEventAfterJump) {
           events.subscriptions[0].handlers.onData({
             ...chunk,
             ts: beforeJump,
           });
         }
-        events.subscriptions[0].handlers.onData(
-          completion(eventAfterJump ? Date.now() : beforeJump),
-        );
+        if (eventAfterJump) {
+          events.subscriptions[0].handlers.onData(completion(Date.now()));
+        }
         vi.advanceTimersByTime(20);
 
         const pauseUpdates = updateSession.mock.calls.filter(
@@ -334,17 +336,15 @@ describe("session event diagnostics", () => {
         }
         service.reset();
       } finally {
-        performanceNow.mockRestore();
         vi.useRealTimers();
       }
     });
 
     it("flushes another run's completion before attributing suspended time", () => {
       vi.useFakeTimers();
-      const performanceNow = vi.spyOn(performance, "now").mockReturnValue(0);
       try {
         const beforeJump = Date.now();
-        const { service, sessions, events, deps } = createHarness({
+        const { service, sessions, events, deps, emitSuspend } = createHarness({
           isPromptPending: true,
           promptStartedAt: beforeJump,
           pausedDurationMs: 0,
@@ -366,6 +366,7 @@ describe("session event diagnostics", () => {
         events.subscriptions[1].handlers.onData(completion(beforeJump));
 
         vi.setSystemTime(beforeJump + 2 * 60 * 60_000);
+        emitSuspend(beforeJump, Date.now());
         events.subscriptions[0].handlers.onData({
           ...chunk,
           ts: Date.now(),
@@ -381,17 +382,62 @@ describe("session event diagnostics", () => {
           ),
         ).toBe(false);
       } finally {
-        performanceNow.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+
+    it("waits for every pending run's first post-suspend event before attributing sleep", () => {
+      vi.useFakeTimers();
+      try {
+        const beforeJump = Date.now();
+        const { service, sessions, events, emitSuspend } = createHarness({
+          isPromptPending: true,
+          promptStartedAt: beforeJump,
+          pausedDurationMs: 0,
+          currentPromptId: 1,
+        });
+        const otherRunId = "run-2";
+        sessions[otherRunId] = {
+          ...sessions[RUN_ID],
+          taskRunId: otherRunId,
+          taskId: "task-2",
+        };
+        (
+          service as unknown as {
+            subscribeToChannel(taskRunId: string): void;
+          }
+        ).subscribeToChannel(otherRunId);
+        events.subscriptions[0].handlers.onData({
+          ...chunk,
+          ts: beforeJump,
+        });
+        events.subscriptions[1].handlers.onData({
+          ...chunk,
+          ts: beforeJump,
+        });
+        vi.advanceTimersByTime(20);
+
+        vi.setSystemTime(beforeJump + 2 * 60 * 60_000);
+        emitSuspend(beforeJump, Date.now());
+        events.subscriptions[0].handlers.onData({
+          ...chunk,
+          ts: Date.now(),
+        });
+        events.subscriptions[1].handlers.onData(completion(beforeJump));
+        vi.advanceTimersByTime(20);
+
+        expect(sessions[otherRunId].pausedDurationMs).toBe(0);
+        service.reset();
+      } finally {
         vi.useRealTimers();
       }
     });
 
     it("preserves suspended time when the live prompt echo arrives", () => {
       vi.useFakeTimers();
-      const performanceNow = vi.spyOn(performance, "now").mockReturnValue(0);
       try {
         const beforeJump = Date.now();
-        const { service, sessions, events } = createHarness({
+        const { service, sessions, events, emitSuspend } = createHarness({
           isPromptPending: true,
           promptStartedAt: beforeJump,
           pausedDurationMs: 0,
@@ -400,6 +446,7 @@ describe("session event diagnostics", () => {
         vi.advanceTimersByTime(20);
 
         vi.setSystemTime(beforeJump + 2 * 60 * 60_000);
+        emitSuspend(beforeJump, Date.now());
         events.subscriptions[0].handlers.onData(promptEcho(Date.now()));
         vi.advanceTimersByTime(20);
 
@@ -409,26 +456,53 @@ describe("session event diagnostics", () => {
         });
         service.reset();
       } finally {
-        performanceNow.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not attach live prompt timing to an echo from a different turn", () => {
+      vi.useFakeTimers();
+      try {
+        const currentPromptStartedAt = Date.now();
+        const { service, sessions, events } = createHarness({
+          isPromptPending: true,
+          promptStartedAt: currentPromptStartedAt,
+          pausedDurationMs: 45_000,
+          currentPromptId: 2,
+        });
+
+        events.subscriptions[0].handlers.onData(
+          promptEcho(currentPromptStartedAt - 1_000, 1),
+        );
+        vi.advanceTimersByTime(20);
+
+        expect(sessions[RUN_ID]).toMatchObject({
+          currentPromptId: 2,
+          promptStartedAt: currentPromptStartedAt,
+          pausedDurationMs: 45_000,
+        });
+        service.reset();
+      } finally {
         vi.useRealTimers();
       }
     });
 
     it("counts suspended and permission-wait time exactly once", async () => {
       vi.useFakeTimers();
-      const performanceNow = vi.spyOn(performance, "now").mockReturnValue(0);
       try {
         const beforeJump = Date.now();
-        const { service, sessions, events, permissions } = createHarness({
-          isPromptPending: true,
-          promptStartedAt: beforeJump,
-          pausedDurationMs: 0,
-          currentPromptId: 1,
-        });
+        const { service, sessions, events, permissions, emitSuspend } =
+          createHarness({
+            isPromptPending: true,
+            promptStartedAt: beforeJump,
+            pausedDurationMs: 0,
+            currentPromptId: 1,
+          });
         events.subscriptions[0].handlers.onData({ ...chunk, ts: beforeJump });
         vi.advanceTimersByTime(20);
 
         vi.setSystemTime(beforeJump + 2 * 60 * 60_000);
+        emitSuspend(beforeJump, Date.now());
         permissions.subscriptions[0].handlers.onData({
           taskRunId: RUN_ID,
           toolCall: { toolCallId: "tool-1", title: "Run command" },
@@ -445,7 +519,6 @@ describe("session event diagnostics", () => {
         );
         service.reset();
       } finally {
-        performanceNow.mockRestore();
         vi.useRealTimers();
       }
     });
@@ -476,5 +549,31 @@ describe("session event diagnostics", () => {
         vi.useRealTimers();
       }
     });
+
+    it.each(["disconnected", "error"] as const)(
+      "stops the silence timer for a terminal local session with %s status",
+      (status) => {
+        vi.useFakeTimers();
+        try {
+          const { service, events } = createHarness({
+            status,
+            isPromptPending: true,
+            promptStartedAt: Date.now(),
+          });
+          events.subscriptions[0].handlers.onData({
+            ...chunk,
+            ts: Date.now(),
+          });
+          vi.advanceTimersByTime(20);
+          vi.advanceTimersByTime(30_000);
+          const remainingTimerCount = vi.getTimerCount();
+
+          expect(remainingTimerCount).toBe(0);
+          service.reset();
+        } finally {
+          vi.useRealTimers();
+        }
+      },
+    );
   });
 });

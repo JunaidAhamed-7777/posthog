@@ -233,6 +233,14 @@ export class WebAuthConnectivity implements IAuthConnectivity {
 }
 
 export const webPowerManager: IPowerManager = {
+  onSuspend(handler: () => void): () => void {
+    const listener = () => {
+      if (document.visibilityState === "hidden") handler();
+    };
+    document.addEventListener("visibilitychange", listener);
+    return () => document.removeEventListener("visibilitychange", listener);
+  },
+
   onResume(handler: () => void): () => void {
     // Closest web analog to an OS resume signal: the tab becoming visible
     // again also covers waking from sleep.

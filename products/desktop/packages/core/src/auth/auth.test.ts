@@ -29,6 +29,7 @@ vi.mock("@posthog/shared", async (importOriginal) => {
 });
 
 const mockPowerManager = vi.hoisted(() => ({
+  onSuspend: vi.fn(() => () => {}),
   onResume: vi.fn(() => () => {}),
   preventSleep: vi.fn(() => () => {}),
   hasBuiltInBattery: vi.fn(async () => false),

@@ -9,6 +9,11 @@ const execFileAsync = promisify(execFile);
 
 @injectable()
 export class ElectronPowerManager implements IPowerManager {
+  public onSuspend(handler: () => void): () => void {
+    powerMonitor.on("suspend", handler);
+    return () => powerMonitor.off("suspend", handler);
+  }
+
   public onResume(handler: () => void): () => void {
     powerMonitor.on("resume", handler);
     return () => powerMonitor.off("resume", handler);

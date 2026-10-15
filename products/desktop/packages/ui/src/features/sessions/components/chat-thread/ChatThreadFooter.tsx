@@ -1,8 +1,5 @@
 import type { Task } from "@posthog/shared/domain-types";
-import {
-  type BuildResult,
-  lastGenerationDurationMs,
-} from "@posthog/ui/features/sessions/components/buildConversationItems";
+import type { BuildResult } from "@posthog/ui/features/sessions/components/buildConversationItems";
 import { SessionFooter } from "@posthog/ui/features/sessions/components/SessionFooter";
 import { SessionStartupRow } from "@posthog/ui/features/sessions/components/SessionStartupRow";
 import {
@@ -54,10 +51,6 @@ export function ChatThreadFooter({
     taskId,
     (session) => session?.pausedDurationMs ?? 0,
   );
-  const isCloud = useSessionSelector(
-    taskId,
-    (session) => session?.isCloud ?? false,
-  );
 
   return (
     <div className="pt-1">
@@ -74,12 +67,11 @@ export function ChatThreadFooter({
         task={task}
         isPromptPending={isPromptPending}
         promptStartedAt={promptStartedAt}
-        lastGenerationDuration={lastGenerationDurationMs(
-          lastTurnInfo,
-          pausedDurationMs,
-          isCloud,
-          performance.timeOrigin,
-        )}
+        lastGenerationDuration={
+          lastTurnInfo?.isComplete
+            ? Math.max(0, lastTurnInfo.durationMs - pausedDurationMs)
+            : null
+        }
         lastStopReason={lastTurnInfo?.stopReason}
         queuedCount={queuedCount}
         hasPendingPermission={pendingPermissionVisible}

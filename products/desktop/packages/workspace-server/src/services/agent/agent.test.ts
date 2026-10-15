@@ -260,6 +260,7 @@ function createMockDependencies() {
       notifyToolCancelled: vi.fn(),
     },
     powerManager: {
+      onSuspend: vi.fn(() => () => {}),
       onResume: vi.fn(() => () => {}),
       preventSleep: vi.fn(() => () => {}),
       hasBuiltInBattery: vi.fn(async () => false),

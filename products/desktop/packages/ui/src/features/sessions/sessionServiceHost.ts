@@ -49,6 +49,11 @@ import {
 } from "@posthog/ui/features/sessions/sessionConfigStore";
 import { sessionStoreSetters } from "@posthog/ui/features/sessions/sessionStore";
 import {
+  getPersistedPromptTiming,
+  removePersistedPromptTiming,
+  setPersistedPromptTiming,
+} from "@posthog/ui/features/sessions/sessionTimingStore";
+import {
   getEffectiveCustomInstructions,
   useSettingsStore,
 } from "@posthog/ui/features/settings/settingsStore";
@@ -59,7 +64,7 @@ import {
   buildPermissionToolMetadata,
   track,
 } from "@posthog/ui/shell/posthogAnalyticsImpl";
-import { isWindows } from "@posthog/ui/utils/platform";
+import { flushRendererStateWrites } from "@posthog/ui/shell/rendererStorage";
 import { logger } from "../../shell/logger";
 import {
   IMPERATIVE_QUERY_CLIENT,
@@ -121,7 +126,24 @@ function buildSessionServiceDeps(): SessionServiceDeps {
   return {
     trpc,
     store: sessionStoreSetters,
-    activeClockIncludesSystemSuspend: isWindows,
+    rendererStartedAtMs: performance.timeOrigin,
+    subscribeToRendererClosing: (handler) => {
+      const onPageHide = (): void => {
+        handler(Date.now());
+        void flushRendererStateWrites();
+      };
+      window.addEventListener("pagehide", onPageHide);
+      return () => window.removeEventListener("pagehide", onPageHide);
+    },
+    subscribeToSystemSuspend: (handler) => {
+      const subscription = trpc.sleep.onSuspendCycle.subscribe(undefined, {
+        onData: handler,
+        onError: (error) => {
+          log.warn("System suspend subscription error", { error });
+        },
+      });
+      return () => subscription.unsubscribe();
+    },
     log,
     toast: {
       error: (msg, opts) => toast.error(msg, opts),
@@ -147,6 +169,9 @@ function buildSessionServiceDeps(): SessionServiceDeps {
       getPersistedConfigOptions(taskRunId) ?? undefined,
     setPersistedConfigOptions,
     removePersistedConfigOptions,
+    getPersistedPromptTiming,
+    setPersistedPromptTiming,
+    removePersistedPromptTiming,
     adapterStore: {
       getAdapter: (taskRunId) =>
         useSessionAdapterStore.getState().getAdapter(taskRunId),

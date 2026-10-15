@@ -196,7 +196,6 @@ const MAX_HOST_ENDED_RESUBSCRIBES = 3;
  */
 const LOCAL_SILENCE_WARN_AFTER_MS = 60_000;
 const LOCAL_SILENCE_CHECK_INTERVAL_MS = 30_000;
-const LOCAL_SUSPEND_DETECT_MARGIN_MS = 90_000;
 
 /** Short label for a log line: `session/update:agent_message_chunk`, `response`. */
 function describeAcpMethod(acpMsg: AcpMessage): string {
@@ -380,6 +379,13 @@ export interface SessionTrpc {
   };
 }
 
+export interface PersistedPromptTiming {
+  promptId: number | null;
+  promptStartedAt: number;
+  pausedDurationMs: number;
+  rendererClosedAt?: number;
+}
+
 export interface ISessionStore {
   setSession(session: AgentSession): void;
   removeSession(taskRunId: string): void;
@@ -487,7 +493,21 @@ export interface SessionServiceDeps {
   trpc: SessionTrpc;
   store: ISessionStore;
   h: SessionServiceHelpers;
-  activeClockIncludesSystemSuspend: boolean;
+  subscribeToSystemSuspend?: (
+    handler: (cycle: { startedAt: number; endedAt: number }) => void,
+  ) => () => void;
+  subscribeToRendererClosing?: (
+    handler: (closedAt: number) => void,
+  ) => () => void;
+  rendererStartedAtMs?: number;
+  getPersistedPromptTiming?: (
+    taskRunId: string,
+  ) => PersistedPromptTiming | undefined;
+  setPersistedPromptTiming?: (
+    taskRunId: string,
+    timing: PersistedPromptTiming,
+  ) => void;
+  removePersistedPromptTiming?: (taskRunId: string) => void;
   log: {
     info(message: string, data?: unknown): void;
     warn(message: string, data?: unknown): void;
@@ -1778,6 +1798,51 @@ export function classifyTurnEventKind(
   return "other";
 }
 
+function readLastPromptIdentity(events: AcpMessage[]): {
+  promptId: number;
+  promptStartedAt: number;
+  completedAt: number | null;
+} | null {
+  let lastPrompt: {
+    promptId: number;
+    promptStartedAt: number;
+    completedAt: number | null;
+  } | null = null;
+  for (const event of events) {
+    const message = event.message;
+    if (
+      isJsonRpcRequest(message) &&
+      message.method === "session/prompt" &&
+      !isSteerPromptParams(message.params) &&
+      typeof message.id === "number"
+    ) {
+      lastPrompt = {
+        promptId: message.id,
+        promptStartedAt: event.ts,
+        completedAt: null,
+      };
+    } else if (
+      lastPrompt &&
+      isJsonRpcResponse(message) &&
+      message.id === lastPrompt.promptId
+    ) {
+      lastPrompt.completedAt = event.ts;
+    }
+  }
+  return lastPrompt;
+}
+
+function promptTimingMatches(
+  timing: PersistedPromptTiming,
+  prompt: { promptId: number; promptStartedAt: number },
+): boolean {
+  return (
+    timing.promptId === prompt.promptId ||
+    (timing.promptId === null &&
+      timing.promptStartedAt <= prompt.promptStartedAt)
+  );
+}
+
 export class SessionService {
   private connectingTasks = new Map<string, Promise<void>>();
   private connectingToastTimers = new Map<
@@ -1843,10 +1908,6 @@ export class SessionService {
   /** Runs already logged for their current stretch of silence. */
   private silenceLogged = new Set<string>();
   private silenceCheckHandle: ReturnType<typeof setInterval> | null = null;
-  private lastSilenceCheckAt: {
-    wallClockMs: number;
-    activeClockMs: number;
-  } | null = null;
   private deferredLocalSuspends = new Map<
     string,
     { durationMs: number; latestSuspendStartedAtMs: number }
@@ -1896,6 +1957,8 @@ export class SessionService {
   /** Uploads started from the composer before a cloud message is submitted. */
   private preparedCloudAttachmentUploads = new Map<string, Promise<string[]>>();
   private idleKilledSubscription: { unsubscribe: () => void } | null = null;
+  private unsubscribeFromSystemSuspend: (() => void) | null = null;
+  private unsubscribeFromRendererClosing: (() => void) | null = null;
   /**
    * Cached preview-config-options responses keyed by `${apiHost}::${adapter}`.
    * Shared across cloud sessions so switching model/adapter reuses the list.
@@ -1949,6 +2012,14 @@ export class SessionService {
         },
       },
     );
+    this.unsubscribeFromSystemSuspend =
+      d.subscribeToSystemSuspend?.((cycle) =>
+        this.handleSystemSuspend(cycle),
+      ) ?? null;
+    this.unsubscribeFromRendererClosing =
+      d.subscribeToRendererClosing?.((closedAt) =>
+        this.handleRendererClosing(closedAt),
+      ) ?? null;
   }
 
   /**
@@ -2005,6 +2076,53 @@ export class SessionService {
     if (params.initialPrompt?.length) {
       session.initialPrompt = params.initialPrompt;
     }
+  }
+
+  private restorePersistedPromptTiming(
+    session: AgentSession,
+    events: AcpMessage[],
+  ): void {
+    const lastPrompt = readLastPromptIdentity(events);
+    const timing = this.d.getPersistedPromptTiming?.(session.taskRunId);
+    if (lastPrompt && timing && promptTimingMatches(timing, lastPrompt)) {
+      const restoredTiming = {
+        ...this.withRendererClosedDowntime(timing, lastPrompt),
+        promptId: lastPrompt.promptId,
+      };
+      session.pausedDurationMs = restoredTiming.pausedDurationMs;
+      this.d.setPersistedPromptTiming?.(session.taskRunId, restoredTiming);
+    }
+  }
+
+  private withRendererClosedDowntime(
+    timing: PersistedPromptTiming,
+    prompt: {
+      promptStartedAt: number;
+      completedAt: number | null;
+    },
+  ): PersistedPromptTiming {
+    const rendererStartedAt = this.d.rendererStartedAtMs;
+    if (
+      timing.rendererClosedAt === undefined ||
+      rendererStartedAt === undefined
+    ) {
+      return timing;
+    }
+    const downtimeStartedAt = Math.max(
+      timing.rendererClosedAt,
+      prompt.promptStartedAt,
+    );
+    const downtimeEndedAt = Math.min(
+      rendererStartedAt,
+      prompt.completedAt ?? rendererStartedAt,
+    );
+    return {
+      ...timing,
+      pausedDurationMs:
+        timing.pausedDurationMs +
+        Math.max(0, downtimeEndedAt - downtimeStartedAt),
+      rendererClosedAt: undefined,
+    };
   }
 
   private async doConnect(params: ConnectParams): Promise<void> {
@@ -2068,6 +2186,7 @@ export class SessionService {
           const events = convertStoredEntriesToEvents(rawEntries);
           const session = createBaseSession(existingRunId, taskId, taskTitle);
           session.events = events;
+          this.restorePersistedPromptTiming(session, events);
           session.logUrl = logUrl;
           session.status = "disconnected";
           session.errorMessage = OFFLINE_SESSION_MESSAGE;
@@ -2092,6 +2211,7 @@ export class SessionService {
           const events = convertStoredEntriesToEvents(logResult.rawEntries);
           const session = createBaseSession(existingRunId, taskId, taskTitle);
           session.events = events;
+          this.restorePersistedPromptTiming(session, events);
           session.logUrl = logUrl;
           session.status = "error";
           session.errorMessage = workspaceResult.missingPath
@@ -2157,6 +2277,7 @@ export class SessionService {
             latestRun.id,
           );
           session.events = convertStoredEntriesToEvents(rawEntries);
+          this.restorePersistedPromptTiming(session, session.events);
           session.logUrl = latestRun.log_url;
         } catch {
           // Ignore log fetch errors
@@ -2256,6 +2377,7 @@ export class SessionService {
     const storedAdapter = this.d.adapterStore.getAdapter(taskRunId);
     const resolvedAdapter = adapter ?? storedAdapter;
     const persistedConfigOptions = this.d.getPersistedConfigOptions(taskRunId);
+    const persistedPromptTiming = this.d.getPersistedPromptTiming?.(taskRunId);
 
     const previous = this.d.store.getSessions()[taskRunId];
 
@@ -2293,15 +2415,49 @@ export class SessionService {
       session.isPromptPending = previous.isPromptPending;
       session.promptStartedAt = previous.promptStartedAt;
       session.currentPromptId = previous.currentPromptId;
-      session.pausedDurationMs = previous.pausedDurationMs;
     }
 
     this.d.store.setSession(session);
     this.updatePromptStateFromEvents(taskRunId, session.events);
-    if (previous) {
-      this.d.store.updateSession(taskRunId, {
-        pausedDurationMs: previous.pausedDurationMs,
-      });
+    const hydratedPrompt = readLastPromptIdentity(session.events);
+    const previousPromptTiming =
+      previous?.promptStartedAt != null
+        ? {
+            promptId: previous.currentPromptId ?? null,
+            promptStartedAt: previous.promptStartedAt,
+            pausedDurationMs: previous.pausedDurationMs ?? 0,
+          }
+        : undefined;
+    const timingCandidates = [
+      persistedPromptTiming,
+      previousPromptTiming,
+    ].filter((timing): timing is PersistedPromptTiming => timing !== undefined);
+    const hydratedSession = this.d.store.getSessions()[taskRunId];
+    const matchingTiming = hydratedPrompt
+      ? timingCandidates.find(
+          (timing) => promptTimingMatches(timing, hydratedPrompt),
+        )
+      : hydratedSession?.isPromptPending
+        ? timingCandidates.find(
+            (timing) =>
+              timing.promptId === (hydratedSession.currentPromptId ?? null),
+          )
+        : undefined;
+    const restoredTiming =
+      matchingTiming && hydratedPrompt
+        ? {
+            ...this.withRendererClosedDowntime(matchingTiming, hydratedPrompt),
+            promptId: hydratedPrompt.promptId,
+          }
+        : matchingTiming;
+    this.d.store.updateSession(taskRunId, {
+      pausedDurationMs: restoredTiming?.pausedDurationMs ?? 0,
+      ...(restoredTiming && hydratedSession?.isPromptPending
+        ? { promptStartedAt: restoredTiming.promptStartedAt }
+        : undefined),
+    });
+    if (restoredTiming) {
+      this.d.setPersistedPromptTiming?.(taskRunId, restoredTiming);
     }
     this.subscribeToChannel(taskRunId);
 
@@ -2537,6 +2693,7 @@ export class SessionService {
       // permanent disconnect (archive, delete, fresh session) may drop them.
       this.d.adapterStore.removeAdapter(taskRunId);
       this.d.removePersistedConfigOptions(taskRunId);
+      this.d.removePersistedPromptTiming?.(taskRunId);
     }
   }
 
@@ -2882,6 +3039,7 @@ export class SessionService {
     const events = convertStoredEntriesToEvents(rawEntries);
     const session = createBaseSession(taskRunId, taskId, taskTitle);
     session.events = events;
+    this.restorePersistedPromptTiming(session, events);
     session.logUrl = logUrl;
     session.status = "disconnected";
     this.d.store.setSession(session);
@@ -2952,7 +3110,7 @@ export class SessionService {
 
   private enqueueSessionEvent(taskRunId: string, acpMsg: AcpMessage): void {
     const now = Date.now();
-    this.recordLocalSuspend(now, {
+    this.applyDeferredLocalSuspend({
       taskRunId,
       timestamp: acpMsg.ts,
     });
@@ -3040,80 +3198,75 @@ export class SessionService {
 
   private ensureSilenceCheck(): void {
     if (this.silenceCheckHandle !== null) return;
-    this.lastSilenceCheckAt = {
-      wallClockMs: Date.now(),
-      activeClockMs: performance.now(),
-    };
     this.silenceCheckHandle = setInterval(
       () => this.checkLocalSessionSilence(),
       LOCAL_SILENCE_CHECK_INTERVAL_MS,
     );
   }
 
-  private recordLocalSuspend(
-    now: number,
-    event?: { taskRunId: string; timestamp: number },
-  ): void {
-    if (this.lastSilenceCheckAt === null) return;
-    const previousCheck = this.lastSilenceCheckAt;
-    const activeNow = performance.now();
-    this.lastSilenceCheckAt = {
-      wallClockMs: now,
-      activeClockMs: activeNow,
-    };
-    const wallClockElapsedMs = now - previousCheck.wallClockMs;
-    const activeClockElapsedMs = activeNow - previousCheck.activeClockMs;
-    const suspendedMs = this.d.activeClockIncludesSystemSuspend
-      ? Math.max(0, wallClockElapsedMs - LOCAL_SILENCE_CHECK_INTERVAL_MS)
-      : wallClockElapsedMs - activeClockElapsedMs;
-    const suspendDetected = suspendedMs > LOCAL_SUSPEND_DETECT_MARGIN_MS;
-    if (suspendDetected) {
-      this.flushSessionEvents();
-    } else if (event && this.deferredLocalSuspends.has(event.taskRunId)) {
-      this.flushSessionEventsForTask(event.taskRunId);
+  private handleRendererClosing(closedAt: number): void {
+    this.flushSessionEvents();
+    for (const session of Object.values(this.d.store.getSessions())) {
+      if (
+        session.isCloud ||
+        session.status !== "connected" ||
+        !session.isPromptPending ||
+        session.promptStartedAt === null ||
+        session.pendingPermissions.size > 0 ||
+        closedAt <= session.promptStartedAt
+      ) {
+        continue;
+      }
+      this.d.setPersistedPromptTiming?.(session.taskRunId, {
+        promptId: session.currentPromptId ?? null,
+        promptStartedAt: session.promptStartedAt,
+        pausedDurationMs: session.pausedDurationMs ?? 0,
+        rendererClosedAt: closedAt,
+      });
     }
-    if (event) {
-      this.applyDeferredLocalSuspend(event);
-    }
-    if (!suspendDetected) return;
-    const suspendStartedAtMs = now - suspendedMs;
+  }
 
+  private handleSystemSuspend(cycle: {
+    startedAt: number;
+    endedAt: number;
+  }): void {
+    if (cycle.endedAt <= cycle.startedAt) return;
+    this.flushSessionEvents();
     for (const session of Object.values(this.d.store.getSessions())) {
       if (
         session.isCloud ||
         !session.isPromptPending ||
-        session.pendingPermissions.size > 0
+        session.pendingPermissions.size > 0 ||
+        session.promptStartedAt === null
       ) {
         continue;
       }
-      if (
-        event?.taskRunId === session.taskRunId &&
-        event.timestamp <= suspendStartedAtMs
-      ) {
-        const promptElapsedMs = Math.max(
-          0,
-          now - (session.promptStartedAt ?? now),
-        );
-        const existing = this.deferredLocalSuspends.get(session.taskRunId);
-        this.deferredLocalSuspends.set(session.taskRunId, {
-          durationMs:
-            (existing?.durationMs ?? 0) +
-            Math.min(suspendedMs, promptElapsedMs),
-          latestSuspendStartedAtMs: Math.max(
-            existing?.latestSuspendStartedAtMs ?? 0,
-            suspendStartedAtMs,
-          ),
-        });
-        continue;
-      }
-      const promptElapsedMs = Math.max(
-        0,
-        now - (session.promptStartedAt ?? now),
-      );
-      this.d.store.updateSession(session.taskRunId, {
-        pausedDurationMs:
-          (session.pausedDurationMs ?? 0) +
-          Math.min(suspendedMs, promptElapsedMs),
+      const durationMs =
+        cycle.endedAt - Math.max(cycle.startedAt, session.promptStartedAt);
+      if (durationMs <= 0) continue;
+      const existing = this.deferredLocalSuspends.get(session.taskRunId);
+      this.deferredLocalSuspends.set(session.taskRunId, {
+        durationMs: (existing?.durationMs ?? 0) + durationMs,
+        latestSuspendStartedAtMs: Math.max(
+          existing?.latestSuspendStartedAtMs ?? 0,
+          cycle.startedAt,
+        ),
+      });
+    }
+  }
+
+  private addPausedDuration(taskRunId: string, durationMs: number): void {
+    if (durationMs <= 0) return;
+    const session = this.d.store.getSessions()[taskRunId];
+    if (!session || session.isCloud || !session.isPromptPending) return;
+    const pausedDurationMs = (session.pausedDurationMs ?? 0) + durationMs;
+    this.d.store.updateSession(taskRunId, { pausedDurationMs });
+    if (session.promptStartedAt !== null) {
+      const persisted = this.d.getPersistedPromptTiming?.(taskRunId);
+      this.d.setPersistedPromptTiming?.(taskRunId, {
+        promptId: session.currentPromptId ?? persisted?.promptId ?? null,
+        promptStartedAt: session.promptStartedAt,
+        pausedDurationMs,
       });
     }
   }
@@ -3122,24 +3275,27 @@ export class SessionService {
     taskRunId: string;
     timestamp: number;
   }): void {
-    const deferred = this.deferredLocalSuspends.get(event.taskRunId);
+    let deferred = this.deferredLocalSuspends.get(event.taskRunId);
+    if (!deferred || event.timestamp <= deferred.latestSuspendStartedAtMs) {
+      return;
+    }
+    this.flushSessionEventsForTask(event.taskRunId);
+    deferred = this.deferredLocalSuspends.get(event.taskRunId);
     if (!deferred || event.timestamp <= deferred.latestSuspendStartedAtMs) {
       return;
     }
     this.deferredLocalSuspends.delete(event.taskRunId);
-    const session = this.d.store.getSessions()[event.taskRunId];
-    if (!session || session.isCloud || !session.isPromptPending) return;
-    this.d.store.updateSession(event.taskRunId, {
-      pausedDurationMs: (session.pausedDurationMs ?? 0) + deferred.durationMs,
-    });
+    this.addPausedDuration(event.taskRunId, deferred.durationMs);
   }
 
   private checkLocalSessionSilence(): void {
     const now = Date.now();
-    this.recordLocalSuspend(now);
     let anyPending = false;
     for (const session of Object.values(this.d.store.getSessions())) {
       if (session.isCloud || !session.isPromptPending) continue;
+      if (session.status === "disconnected" || session.status === "error") {
+        continue;
+      }
       anyPending = true;
       if (session.status !== "connected") continue;
       const { taskRunId } = session;
@@ -3169,7 +3325,6 @@ export class SessionService {
     if (!anyPending && this.silenceCheckHandle !== null) {
       clearInterval(this.silenceCheckHandle);
       this.silenceCheckHandle = null;
-      this.lastSilenceCheckAt = null;
       this.deferredLocalSuspends.clear();
     }
   }
@@ -3458,7 +3613,6 @@ export class SessionService {
       clearInterval(this.silenceCheckHandle);
       this.silenceCheckHandle = null;
     }
-    this.lastSilenceCheckAt = null;
     this.deferredLocalSuspends.clear();
     for (const timer of this.eventEvictionTimers.values()) clearTimeout(timer);
     this.eventEvictionTimers.clear();
@@ -3485,6 +3639,10 @@ export class SessionService {
     this.cloudRunIdleTracker.clear();
     this.idleKilledSubscription?.unsubscribe();
     this.idleKilledSubscription = null;
+    this.unsubscribeFromSystemSuspend?.();
+    this.unsubscribeFromSystemSuspend = null;
+    this.unsubscribeFromRendererClosing?.();
+    this.unsubscribeFromRendererClosing = null;
   }
 
   /**
@@ -3661,21 +3819,40 @@ export class SessionService {
         const promptBelongsToRun = promptSession?.isCloud
           ? promptPosition?.taskRunId === taskRunId
           : true;
-        const isLivePromptEcho =
+        const isPendingLocalPromptEcho =
           isLive && !promptSession?.isCloud && promptSession?.isPromptPending;
+        const preservesLivePromptTiming =
+          isPendingLocalPromptEcho &&
+          (promptSession.currentPromptId === msg.id ||
+            ((promptSession.currentPromptId === null ||
+              promptSession.currentPromptId === undefined) &&
+              promptSession.promptStartedAt !== null &&
+              acpMsg.ts >= promptSession.promptStartedAt));
+        if (isPendingLocalPromptEcho && !preservesLivePromptTiming) {
+          continue;
+        }
+        const promptStartedAt = preservesLivePromptTiming
+          ? (promptSession.promptStartedAt ?? acpMsg.ts)
+          : acpMsg.ts;
+        const pausedDurationMs = preservesLivePromptTiming
+          ? (promptSession.pausedDurationMs ?? 0)
+          : 0;
         this.d.store.updateSession(taskRunId, {
           isPromptPending: true,
-          promptStartedAt: isLivePromptEcho
-            ? (promptSession.promptStartedAt ?? acpMsg.ts)
-            : acpMsg.ts,
-          pausedDurationMs: isLivePromptEcho
-            ? (promptSession.pausedDurationMs ?? 0)
-            : 0,
+          promptStartedAt,
+          pausedDurationMs,
           currentPromptId: msg.id,
           ...(promptBelongsToRun
             ? { firstPromptForRunId: taskRunId }
             : undefined),
         });
+        if (isLive && !promptSession?.isCloud && typeof msg.id === "number") {
+          this.d.setPersistedPromptTiming?.(taskRunId, {
+            promptId: msg.id,
+            promptStartedAt,
+            pausedDurationMs,
+          });
+        }
         this.liveTurnContent.set(taskRunId, {
           startedAtTs: acpMsg.ts,
           agentTextChunks: 0,
@@ -4176,7 +4353,10 @@ export class SessionService {
     },
   ): void {
     const receivedAt = Date.now();
-    this.recordLocalSuspend(receivedAt);
+    this.applyDeferredLocalSuspend({
+      taskRunId,
+      timestamp: receivedAt,
+    });
     this.d.log.info("Permission request received in renderer", {
       taskRunId,
       toolCallId: payload.toolCall.toolCallId,
@@ -4737,10 +4917,15 @@ export class SessionService {
     promptText: string,
   ): void {
     const now = Date.now();
-    this.recordLocalSuspend(now);
     this.deferredLocalSuspends.delete(taskRunId);
     this.d.store.updateSession(taskRunId, {
       isPromptPending: true,
+      promptStartedAt: now,
+      pausedDurationMs: 0,
+      currentPromptId: null,
+    });
+    this.d.setPersistedPromptTiming?.(taskRunId, {
+      promptId: null,
       promptStartedAt: now,
       pausedDurationMs: 0,
     });
@@ -4777,14 +4962,22 @@ export class SessionService {
         sessionId: session.taskRunId,
         prompt: blocks,
       });
-      this.recordLocalSuspend(Date.now());
+      const settledAt = Date.now();
+      this.applyDeferredLocalSuspend({
+        taskRunId: session.taskRunId,
+        timestamp: settledAt,
+      });
       this.d.store.updateSession(session.taskRunId, {
         isPromptPending: false,
         promptStartedAt: null,
       });
       return result;
     } catch (error) {
-      this.recordLocalSuspend(Date.now());
+      const settledAt = Date.now();
+      this.applyDeferredLocalSuspend({
+        taskRunId: session.taskRunId,
+        timestamp: settledAt,
+      });
       const errorMessage =
         error instanceof Error ? error.message : String(error);
       const errorDetails = (error as { data?: { details?: string } }).data
@@ -6117,7 +6310,6 @@ export class SessionService {
 
   private resolvePermission(session: AgentSession, toolCallId: string): void {
     const resolvedAt = Date.now();
-    this.recordLocalSuspend(resolvedAt);
     const current = this.d.store.getSessions()[session.taskRunId] ?? session;
     const permission = current.pendingPermissions.get(toolCallId);
     const newPermissions = new Map(current.pendingPermissions);
@@ -6125,11 +6317,10 @@ export class SessionService {
     this.d.store.setPendingPermissions(session.taskRunId, newPermissions);
 
     if (permission?.receivedAt) {
-      this.d.store.updateSession(session.taskRunId, {
-        pausedDurationMs:
-          (current.pausedDurationMs ?? 0) +
-          (resolvedAt - permission.receivedAt),
-      });
+      this.addPausedDuration(
+        session.taskRunId,
+        resolvedAt - permission.receivedAt,
+      );
     }
   }
 

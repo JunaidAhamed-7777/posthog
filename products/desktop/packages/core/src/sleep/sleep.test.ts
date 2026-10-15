@@ -16,6 +16,7 @@ function makeLogger() {
 function createDeps(preventSleepInitially = true) {
   const release = vi.fn();
   const powerManager: IPowerManager = {
+    onSuspend: vi.fn(() => () => {}),
     onResume: vi.fn(() => () => {}),
     preventSleep: vi.fn(() => release),
     hasBuiltInBattery: vi.fn(async () => false),

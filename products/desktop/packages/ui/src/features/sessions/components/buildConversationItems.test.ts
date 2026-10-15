@@ -5,10 +5,7 @@ import {
   buildConversationItems,
   type ConversationItem,
   hasSetupProgressForRun,
-  lastGenerationDurationMs,
 } from "./buildConversationItems";
-
-const HOUR_MS = 60 * 60_000;
 
 function consoleMsg(ts: number, message: string, level = "info"): AcpMessage {
   return {
@@ -646,90 +643,9 @@ describe("buildConversationItems", () => {
     expect(result.lastTurnInfo).toEqual({
       isComplete: true,
       durationMs: 15,
-      longestGapMs: 15,
-      longestGapStartedAtMs: 10,
-      longestGapEndedAtMs: 25,
       stopReason: "end_turn",
     });
   });
-
-  it.each([
-    {
-      name: "a short turn",
-      gapMs: 60_000,
-      pausedDurationMs: 0,
-      isCloud: false,
-      rendererStartedAtMs: 0,
-      expectedDurationMs: 70_000,
-    },
-    {
-      name: "a permission wait",
-      gapMs: 3 * HOUR_MS,
-      pausedDurationMs: 3 * HOUR_MS,
-      isCloud: false,
-      rendererStartedAtMs: 0,
-      expectedDurationMs: 10_000,
-    },
-    {
-      name: "a sleep during a silent tool call",
-      gapMs: 65 * 60_000,
-      pausedDurationMs: HOUR_MS,
-      isCloud: false,
-      rendererStartedAtMs: 0,
-      expectedDurationMs: 5 * 60_000 + 10_000,
-    },
-    {
-      name: "a long quiet local turn after renderer startup",
-      gapMs: 45 * 60_000,
-      pausedDurationMs: 0,
-      isCloud: false,
-      rendererStartedAtMs: 0,
-      expectedDurationMs: 45 * 60_000 + 10_000,
-    },
-    {
-      name: "an unexplained overnight gap",
-      gapMs: 22 * HOUR_MS,
-      pausedDurationMs: 0,
-      isCloud: false,
-      rendererStartedAtMs: 12 * HOUR_MS,
-      expectedDurationMs: null,
-    },
-    {
-      name: "a quiet cloud turn",
-      gapMs: 2 * HOUR_MS,
-      pausedDurationMs: 0,
-      isCloud: true,
-      rendererStartedAtMs: HOUR_MS,
-      expectedDurationMs: 2 * HOUR_MS + 10_000,
-    },
-  ])(
-    "reports the generation duration for $name",
-    ({
-      gapMs,
-      pausedDurationMs,
-      isCloud,
-      rendererStartedAtMs,
-      expectedDurationMs,
-    }) => {
-      const { lastTurnInfo } = buildConversationItems(
-        [
-          userPromptMsg(1_000, 1, "hello"),
-          agentMessageMsg(11_000, "working"),
-          turnCompleteMsg(11_000 + gapMs),
-        ],
-        null,
-      );
-
-      expect(
-        lastGenerationDurationMs(
-          lastTurnInfo,
-          pausedDurationMs,
-          isCloud,
-          rendererStartedAtMs,
-        ),
-      ).toBe(expectedDurationMs);
-    },
-  );
 
   it("keeps attachment-only prompts visible", () => {
     const uri = makeAttachmentUri("/tmp/test.txt");
