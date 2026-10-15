@@ -252,6 +252,7 @@ describe("SessionService run-less local task recovery", () => {
       isPromptPending: true,
       promptStartedAt: 1,
       currentPromptId: 1,
+      pausedDurationMs: 45_000,
     };
     const rawEntries: StoredLogEntry[] = [
       {
@@ -279,6 +280,7 @@ describe("SessionService run-less local task recovery", () => {
       isPromptPending: false,
       promptStartedAt: null,
       currentPromptId: null,
+      pausedDurationMs: 45_000,
     });
   });
 

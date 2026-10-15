@@ -487,6 +487,7 @@ export interface SessionServiceDeps {
   trpc: SessionTrpc;
   store: ISessionStore;
   h: SessionServiceHelpers;
+  activeClockIncludesSystemSuspend: boolean;
   log: {
     info(message: string, data?: unknown): void;
     warn(message: string, data?: unknown): void;
@@ -2297,6 +2298,11 @@ export class SessionService {
 
     this.d.store.setSession(session);
     this.updatePromptStateFromEvents(taskRunId, session.events);
+    if (previous) {
+      this.d.store.updateSession(taskRunId, {
+        pausedDurationMs: previous.pausedDurationMs,
+      });
+    }
     this.subscribeToChannel(taskRunId);
 
     try {
@@ -3055,13 +3061,21 @@ export class SessionService {
       wallClockMs: now,
       activeClockMs: activeNow,
     };
+    const wallClockElapsedMs = now - previousCheck.wallClockMs;
+    const activeClockElapsedMs = activeNow - previousCheck.activeClockMs;
+    const suspendedMs = this.d.activeClockIncludesSystemSuspend
+      ? Math.max(0, wallClockElapsedMs - LOCAL_SILENCE_CHECK_INTERVAL_MS)
+      : wallClockElapsedMs - activeClockElapsedMs;
+    const suspendDetected = suspendedMs > LOCAL_SUSPEND_DETECT_MARGIN_MS;
+    if (suspendDetected) {
+      this.flushSessionEvents();
+    } else if (event && this.deferredLocalSuspends.has(event.taskRunId)) {
+      this.flushSessionEventsForTask(event.taskRunId);
+    }
     if (event) {
       this.applyDeferredLocalSuspend(event);
     }
-    const wallClockElapsedMs = now - previousCheck.wallClockMs;
-    const activeClockElapsedMs = activeNow - previousCheck.activeClockMs;
-    const suspendedMs = wallClockElapsedMs - activeClockElapsedMs;
-    if (suspendedMs <= LOCAL_SUSPEND_DETECT_MARGIN_MS) return;
+    if (!suspendDetected) return;
     const suspendStartedAtMs = now - suspendedMs;
 
     for (const session of Object.values(this.d.store.getSessions())) {
@@ -3126,8 +3140,8 @@ export class SessionService {
     let anyPending = false;
     for (const session of Object.values(this.d.store.getSessions())) {
       if (session.isCloud || !session.isPromptPending) continue;
-      if (session.status !== "connected") continue;
       anyPending = true;
+      if (session.status !== "connected") continue;
       const { taskRunId } = session;
       if (this.silenceLogged.has(taskRunId)) continue;
       const lastSignalAt = Math.max(
@@ -3647,10 +3661,16 @@ export class SessionService {
         const promptBelongsToRun = promptSession?.isCloud
           ? promptPosition?.taskRunId === taskRunId
           : true;
+        const isLivePromptEcho =
+          isLive && !promptSession?.isCloud && promptSession?.isPromptPending;
         this.d.store.updateSession(taskRunId, {
           isPromptPending: true,
-          promptStartedAt: acpMsg.ts,
-          pausedDurationMs: 0,
+          promptStartedAt: isLivePromptEcho
+            ? (promptSession.promptStartedAt ?? acpMsg.ts)
+            : acpMsg.ts,
+          pausedDurationMs: isLivePromptEcho
+            ? (promptSession.pausedDurationMs ?? 0)
+            : 0,
           currentPromptId: msg.id,
           ...(promptBelongsToRun
             ? { firstPromptForRunId: taskRunId }
@@ -4155,6 +4175,8 @@ export class SessionService {
       taskRunId: string;
     },
   ): void {
+    const receivedAt = Date.now();
+    this.recordLocalSuspend(receivedAt);
     this.d.log.info("Permission request received in renderer", {
       taskRunId,
       toolCallId: payload.toolCall.toolCallId,
@@ -4178,7 +4200,7 @@ export class SessionService {
     // Add receivedAt to create PermissionRequest
     newPermissions.set(payload.toolCall.toolCallId, {
       ...payload,
-      receivedAt: Date.now(),
+      receivedAt,
     });
 
     this.d.store.setPendingPermissions(taskRunId, newPermissions);
@@ -4755,12 +4777,14 @@ export class SessionService {
         sessionId: session.taskRunId,
         prompt: blocks,
       });
+      this.recordLocalSuspend(Date.now());
       this.d.store.updateSession(session.taskRunId, {
         isPromptPending: false,
         promptStartedAt: null,
       });
       return result;
     } catch (error) {
+      this.recordLocalSuspend(Date.now());
       const errorMessage =
         error instanceof Error ? error.message : String(error);
       const errorDetails = (error as { data?: { details?: string } }).data
@@ -6092,16 +6116,19 @@ export class SessionService {
   // --- Permissions ---
 
   private resolvePermission(session: AgentSession, toolCallId: string): void {
-    const permission = session.pendingPermissions.get(toolCallId);
-    const newPermissions = new Map(session.pendingPermissions);
+    const resolvedAt = Date.now();
+    this.recordLocalSuspend(resolvedAt);
+    const current = this.d.store.getSessions()[session.taskRunId] ?? session;
+    const permission = current.pendingPermissions.get(toolCallId);
+    const newPermissions = new Map(current.pendingPermissions);
     newPermissions.delete(toolCallId);
     this.d.store.setPendingPermissions(session.taskRunId, newPermissions);
 
     if (permission?.receivedAt) {
       this.d.store.updateSession(session.taskRunId, {
         pausedDurationMs:
-          (session.pausedDurationMs ?? 0) +
-          (Date.now() - permission.receivedAt),
+          (current.pausedDurationMs ?? 0) +
+          (resolvedAt - permission.receivedAt),
       });
     }
   }

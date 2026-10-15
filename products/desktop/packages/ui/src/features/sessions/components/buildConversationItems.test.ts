@@ -647,6 +647,8 @@ describe("buildConversationItems", () => {
       isComplete: true,
       durationMs: 15,
       longestGapMs: 15,
+      longestGapStartedAtMs: 10,
+      longestGapEndedAtMs: 25,
       stopReason: "end_turn",
     });
   });
@@ -657,6 +659,7 @@ describe("buildConversationItems", () => {
       gapMs: 60_000,
       pausedDurationMs: 0,
       isCloud: false,
+      rendererStartedAtMs: 0,
       expectedDurationMs: 70_000,
     },
     {
@@ -664,6 +667,7 @@ describe("buildConversationItems", () => {
       gapMs: 3 * HOUR_MS,
       pausedDurationMs: 3 * HOUR_MS,
       isCloud: false,
+      rendererStartedAtMs: 0,
       expectedDurationMs: 10_000,
     },
     {
@@ -671,13 +675,23 @@ describe("buildConversationItems", () => {
       gapMs: 65 * 60_000,
       pausedDurationMs: HOUR_MS,
       isCloud: false,
+      rendererStartedAtMs: 0,
       expectedDurationMs: 5 * 60_000 + 10_000,
+    },
+    {
+      name: "a long quiet local turn after renderer startup",
+      gapMs: 45 * 60_000,
+      pausedDurationMs: 0,
+      isCloud: false,
+      rendererStartedAtMs: 0,
+      expectedDurationMs: 45 * 60_000 + 10_000,
     },
     {
       name: "an unexplained overnight gap",
       gapMs: 22 * HOUR_MS,
       pausedDurationMs: 0,
       isCloud: false,
+      rendererStartedAtMs: 12 * HOUR_MS,
       expectedDurationMs: null,
     },
     {
@@ -685,11 +699,18 @@ describe("buildConversationItems", () => {
       gapMs: 2 * HOUR_MS,
       pausedDurationMs: 0,
       isCloud: true,
+      rendererStartedAtMs: HOUR_MS,
       expectedDurationMs: 2 * HOUR_MS + 10_000,
     },
   ])(
     "reports the generation duration for $name",
-    ({ gapMs, pausedDurationMs, isCloud, expectedDurationMs }) => {
+    ({
+      gapMs,
+      pausedDurationMs,
+      isCloud,
+      rendererStartedAtMs,
+      expectedDurationMs,
+    }) => {
       const { lastTurnInfo } = buildConversationItems(
         [
           userPromptMsg(1_000, 1, "hello"),
@@ -700,7 +721,12 @@ describe("buildConversationItems", () => {
       );
 
       expect(
-        lastGenerationDurationMs(lastTurnInfo, pausedDurationMs, isCloud),
+        lastGenerationDurationMs(
+          lastTurnInfo,
+          pausedDurationMs,
+          isCloud,
+          rendererStartedAtMs,
+        ),
       ).toBe(expectedDurationMs);
     },
   );

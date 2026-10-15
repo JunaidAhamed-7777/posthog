@@ -81,6 +81,8 @@ export interface LastTurnInfo {
   isComplete: boolean;
   durationMs: number;
   longestGapMs: number;
+  longestGapStartedAtMs: number | null;
+  longestGapEndedAtMs: number | null;
   stopReason?: string;
 }
 
@@ -90,10 +92,17 @@ export function lastGenerationDurationMs(
   info: LastTurnInfo | null,
   pausedDurationMs: number,
   isCloud: boolean,
+  rendererStartedAtMs: number,
 ): number | null {
   if (!info?.isComplete) return null;
+  const longestGapSpansRendererStart =
+    info.longestGapStartedAtMs !== null &&
+    info.longestGapEndedAtMs !== null &&
+    info.longestGapStartedAtMs < rendererStartedAtMs &&
+    info.longestGapEndedAtMs >= rendererStartedAtMs;
   if (
     !isCloud &&
+    longestGapSpansRendererStart &&
     info.longestGapMs - pausedDurationMs > MAX_UNEXPLAINED_TURN_GAP_MS
   ) {
     return null;
@@ -144,6 +153,8 @@ interface TurnState {
   durationMs: number;
   lastEventAt: number;
   longestGapMs: number;
+  longestGapStartedAtMs: number | null;
+  longestGapEndedAtMs: number | null;
   toolCalls: Map<string, ToolCall>;
   context: TurnContext;
   gitAction: ReturnType<typeof parseGitActionMessage>;
@@ -224,7 +235,12 @@ function noteActivity(b: ItemBuilder, ts: number) {
   }
   const turn = b.currentTurn;
   if (turn && !turn.isComplete && ts > turn.lastEventAt) {
-    turn.longestGapMs = Math.max(turn.longestGapMs, ts - turn.lastEventAt);
+    const gapMs = ts - turn.lastEventAt;
+    if (gapMs > turn.longestGapMs) {
+      turn.longestGapMs = gapMs;
+      turn.longestGapStartedAtMs = turn.lastEventAt;
+      turn.longestGapEndedAtMs = ts;
+    }
     turn.lastEventAt = ts;
   }
 }
@@ -568,6 +584,8 @@ export function readLastTurnInfo(b: ItemBuilder): LastTurnInfo | null {
         isComplete: b.currentTurn.isComplete,
         durationMs: b.currentTurn.durationMs,
         longestGapMs: b.currentTurn.longestGapMs,
+        longestGapStartedAtMs: b.currentTurn.longestGapStartedAtMs,
+        longestGapEndedAtMs: b.currentTurn.longestGapEndedAtMs,
         stopReason: b.currentTurn.stopReason,
       }
     : null;
@@ -669,6 +687,8 @@ function handlePromptRequest(
     durationMs: -ts,
     lastEventAt: ts,
     longestGapMs: 0,
+    longestGapStartedAtMs: null,
+    longestGapEndedAtMs: null,
     toolCalls,
     context,
     gitAction,
@@ -1198,6 +1218,8 @@ function ensureImplicitTurn(b: ItemBuilder, ts: number) {
     durationMs: -ts,
     lastEventAt: ts,
     longestGapMs: 0,
+    longestGapStartedAtMs: null,
+    longestGapEndedAtMs: null,
     toolCalls,
     context,
     gitAction: { isGitAction: false, actionType: null, prompt: "" },

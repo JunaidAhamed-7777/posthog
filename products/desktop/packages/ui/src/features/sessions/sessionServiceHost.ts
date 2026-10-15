@@ -59,6 +59,7 @@ import {
   buildPermissionToolMetadata,
   track,
 } from "@posthog/ui/shell/posthogAnalyticsImpl";
+import { isWindows } from "@posthog/ui/utils/platform";
 import { logger } from "../../shell/logger";
 import {
   IMPERATIVE_QUERY_CLIENT,
@@ -120,6 +121,7 @@ function buildSessionServiceDeps(): SessionServiceDeps {
   return {
     trpc,
     store: sessionStoreSetters,
+    activeClockIncludesSystemSuspend: isWindows,
     log,
     toast: {
       error: (msg, opts) => toast.error(msg, opts),

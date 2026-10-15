@@ -78,6 +78,7 @@ export function ChatThreadFooter({
           lastTurnInfo,
           pausedDurationMs,
           isCloud,
+          performance.timeOrigin,
         )}
         lastStopReason={lastTurnInfo?.stopReason}
         queuedCount={queuedCount}

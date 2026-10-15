@@ -47,6 +47,7 @@ function createHarness() {
   const deps = {
     store,
     h: { extractSkillButtonId: () => undefined },
+    activeClockIncludesSystemSuspend: false,
     log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     toast: { error: vi.fn(), info: vi.fn() },
     track: vi.fn(),
@@ -81,6 +82,42 @@ function createHarness() {
 type RecoverSpy = ReturnType<typeof createHarness>["recoverSpy"];
 
 describe("SessionService prompt recovery on fatal session errors", () => {
+  it.each(["resolve", "reject"] as const)(
+    "records suspended time before a prompt mutation can %s and clear pending state",
+    async (outcome) => {
+      vi.useFakeTimers();
+      const performanceNow = vi.spyOn(performance, "now").mockReturnValue(0);
+      try {
+        const { service, sessions, promptMutate } = createHarness();
+        let resolveMutation: (result: { stopReason: string }) => void = () =>
+          undefined;
+        let rejectMutation: (error: Error) => void = () => undefined;
+        promptMutate.mockReturnValue(
+          new Promise((resolve, reject) => {
+            resolveMutation = resolve;
+            rejectMutation = reject;
+          }),
+        );
+
+        const startedAt = Date.now();
+        const result = service.sendPrompt(TASK_ID, "hello again");
+        vi.setSystemTime(startedAt + 2 * 60 * 60_000);
+        if (outcome === "resolve") {
+          resolveMutation({ stopReason: "end_turn" });
+          await expect(result).resolves.toEqual({ stopReason: "end_turn" });
+        } else {
+          rejectMutation(new Error("provider failed"));
+          await expect(result).rejects.toThrow("provider failed");
+        }
+
+        expect(sessions[TASK_RUN_ID].pausedDurationMs).toBe(2 * 60 * 60_000);
+      } finally {
+        performanceNow.mockRestore();
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it("recovers the session and resends the prompt once", async () => {
     const { service, promptMutate, recoverSpy } = createHarness();
     promptMutate
