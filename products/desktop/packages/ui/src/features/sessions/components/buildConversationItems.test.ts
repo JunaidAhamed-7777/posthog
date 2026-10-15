@@ -656,29 +656,40 @@ describe("buildConversationItems", () => {
       name: "a short turn",
       gapMs: 60_000,
       pausedDurationMs: 0,
+      isCloud: false,
       expectedDurationMs: 70_000,
     },
     {
       name: "a permission wait",
       gapMs: 3 * HOUR_MS,
       pausedDurationMs: 3 * HOUR_MS,
+      isCloud: false,
       expectedDurationMs: 10_000,
     },
     {
-      name: "a detected sleep",
-      gapMs: 2 * HOUR_MS,
-      pausedDurationMs: 2 * HOUR_MS - 30_000,
-      expectedDurationMs: 40_000,
+      name: "a sleep during a silent tool call",
+      gapMs: 65 * 60_000,
+      pausedDurationMs: HOUR_MS,
+      isCloud: false,
+      expectedDurationMs: 5 * 60_000 + 10_000,
     },
     {
       name: "an unexplained overnight gap",
       gapMs: 22 * HOUR_MS,
       pausedDurationMs: 0,
+      isCloud: false,
       expectedDurationMs: null,
+    },
+    {
+      name: "a quiet cloud turn",
+      gapMs: 2 * HOUR_MS,
+      pausedDurationMs: 0,
+      isCloud: true,
+      expectedDurationMs: 2 * HOUR_MS + 10_000,
     },
   ])(
     "reports the generation duration for $name",
-    ({ gapMs, pausedDurationMs, expectedDurationMs }) => {
+    ({ gapMs, pausedDurationMs, isCloud, expectedDurationMs }) => {
       const { lastTurnInfo } = buildConversationItems(
         [
           userPromptMsg(1_000, 1, "hello"),
@@ -688,9 +699,9 @@ describe("buildConversationItems", () => {
         null,
       );
 
-      expect(lastGenerationDurationMs(lastTurnInfo, pausedDurationMs)).toBe(
-        expectedDurationMs,
-      );
+      expect(
+        lastGenerationDurationMs(lastTurnInfo, pausedDurationMs, isCloud),
+      ).toBe(expectedDurationMs);
     },
   );
 

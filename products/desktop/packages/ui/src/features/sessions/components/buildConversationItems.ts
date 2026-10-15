@@ -85,16 +85,16 @@ export interface LastTurnInfo {
 }
 
 const MAX_UNEXPLAINED_TURN_GAP_MS = 30 * 60_000;
-const PAUSE_MATCH_TOLERANCE_MS = 60_000;
 
 export function lastGenerationDurationMs(
   info: LastTurnInfo | null,
   pausedDurationMs: number,
+  isCloud: boolean,
 ): number | null {
   if (!info?.isComplete) return null;
   if (
-    info.longestGapMs > MAX_UNEXPLAINED_TURN_GAP_MS &&
-    info.longestGapMs - pausedDurationMs > PAUSE_MATCH_TOLERANCE_MS
+    !isCloud &&
+    info.longestGapMs - pausedDurationMs > MAX_UNEXPLAINED_TURN_GAP_MS
   ) {
     return null;
   }

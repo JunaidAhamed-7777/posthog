@@ -1842,7 +1842,10 @@ export class SessionService {
   /** Runs already logged for their current stretch of silence. */
   private silenceLogged = new Set<string>();
   private silenceCheckHandle: ReturnType<typeof setInterval> | null = null;
-  private lastSilenceCheckAt: number | null = null;
+  private lastSilenceCheckAt: {
+    wallClockMs: number;
+    activeClockMs: number;
+  } | null = null;
   /** Active cloud task watchers, keyed by taskId */
   private cloudTaskWatchers = new Map<string, CloudTaskWatcher>();
   private olderTranscriptLoads = new Set<string>();
@@ -2939,7 +2942,10 @@ export class SessionService {
 
   private enqueueSessionEvent(taskRunId: string, acpMsg: AcpMessage): void {
     const now = Date.now();
-    this.recordLocalSuspend(now);
+    this.recordLocalSuspend(now, {
+      taskRunId,
+      timestamp: acpMsg.ts,
+    });
     this.hostEndedResubscribes.delete(taskRunId);
     this.lastSessionEventAt.set(taskRunId, now);
     this.silenceLogged.delete(taskRunId);
@@ -3024,18 +3030,30 @@ export class SessionService {
 
   private ensureSilenceCheck(): void {
     if (this.silenceCheckHandle !== null) return;
-    this.lastSilenceCheckAt = Date.now();
+    this.lastSilenceCheckAt = {
+      wallClockMs: Date.now(),
+      activeClockMs: performance.now(),
+    };
     this.silenceCheckHandle = setInterval(
       () => this.checkLocalSessionSilence(),
       LOCAL_SILENCE_CHECK_INTERVAL_MS,
     );
   }
 
-  private recordLocalSuspend(now: number): void {
+  private recordLocalSuspend(
+    now: number,
+    event?: { taskRunId: string; timestamp: number },
+  ): void {
     if (this.lastSilenceCheckAt === null) return;
-    const elapsedMs = now - this.lastSilenceCheckAt;
-    this.lastSilenceCheckAt = now;
-    const suspendedMs = elapsedMs - LOCAL_SILENCE_CHECK_INTERVAL_MS;
+    const previousCheck = this.lastSilenceCheckAt;
+    const activeNow = performance.now();
+    this.lastSilenceCheckAt = {
+      wallClockMs: now,
+      activeClockMs: activeNow,
+    };
+    const wallClockElapsedMs = now - previousCheck.wallClockMs;
+    const activeClockElapsedMs = activeNow - previousCheck.activeClockMs;
+    const suspendedMs = wallClockElapsedMs - activeClockElapsedMs;
     if (suspendedMs <= LOCAL_SUSPEND_DETECT_MARGIN_MS) return;
 
     for (const session of Object.values(this.d.store.getSessions())) {
@@ -3043,6 +3061,12 @@ export class SessionService {
         session.isCloud ||
         !session.isPromptPending ||
         session.pendingPermissions.size > 0
+      ) {
+        continue;
+      }
+      if (
+        event?.taskRunId === session.taskRunId &&
+        event.timestamp <= previousCheck.wallClockMs
       ) {
         continue;
       }
@@ -4650,9 +4674,11 @@ export class SessionService {
     blocks: ContentBlock[],
     promptText: string,
   ): void {
+    const now = Date.now();
+    this.recordLocalSuspend(now);
     this.d.store.updateSession(taskRunId, {
       isPromptPending: true,
-      promptStartedAt: Date.now(),
+      promptStartedAt: now,
       pausedDurationMs: 0,
     });
     this.silenceLogged.delete(taskRunId);

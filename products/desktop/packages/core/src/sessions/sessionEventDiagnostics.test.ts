@@ -131,15 +131,15 @@ describe("session event diagnostics", () => {
         },
       },
     };
-    const completion = {
+    const completion = (ts: number) => ({
       type: "acp_message",
-      ts: 2,
+      ts,
       message: {
         jsonrpc: "2.0",
         id: 1,
         result: { stopReason: "end_turn" },
       },
-    };
+    });
 
     it.each([
       {
@@ -191,19 +191,45 @@ describe("session event diagnostics", () => {
       {
         name: "records a long clock jump before the completion event is applied",
         clockJumpMs: 2 * 60 * 60_000,
-        expectedPausedMs: 2 * 60 * 60_000 - 30_000,
+        activeClockJumpMs: 0,
+        eventAfterJump: true,
+        expectedPausedMs: 2 * 60 * 60_000,
       },
       {
         name: "ignores normal timer throttling",
         clockJumpMs: 60_000,
+        activeClockJumpMs: 0,
+        eventAfterJump: true,
         expectedPausedMs: null,
       },
-    ])("$name", ({ clockJumpMs, expectedPausedMs }) => {
+      {
+        name: "does not pause a turn that completed before the clock jump",
+        clockJumpMs: 2 * 60 * 60_000,
+        activeClockJumpMs: 0,
+        eventAfterJump: false,
+        expectedPausedMs: null,
+      },
+      {
+        name: "does not treat a long renderer stall as suspended time",
+        clockJumpMs: 2 * 60 * 60_000,
+        activeClockJumpMs: 2 * 60 * 60_000,
+        eventAfterJump: true,
+        expectedPausedMs: null,
+      },
+    ])("$name", (scenario) => {
+      const {
+        clockJumpMs,
+        activeClockJumpMs,
+        eventAfterJump,
+        expectedPausedMs,
+      } = scenario;
       vi.useFakeTimers();
+      const performanceNow = vi.spyOn(performance, "now").mockReturnValue(0);
       try {
+        const beforeJump = Date.now();
         const { events, deps, service } = createHarness({
           isPromptPending: true,
-          promptStartedAt: Date.now(),
+          promptStartedAt: beforeJump,
           pausedDurationMs: 0,
           currentPromptId: 1,
         });
@@ -213,8 +239,11 @@ describe("session event diagnostics", () => {
         >;
         updateSession.mockClear();
 
-        vi.setSystemTime(Date.now() + clockJumpMs);
-        events.subscriptions[0].handlers.onData(completion);
+        vi.setSystemTime(beforeJump + clockJumpMs);
+        performanceNow.mockReturnValue(activeClockJumpMs);
+        events.subscriptions[0].handlers.onData(
+          completion(eventAfterJump ? Date.now() : beforeJump),
+        );
         vi.advanceTimersByTime(20);
 
         const pauseUpdates = updateSession.mock.calls.filter(
@@ -238,6 +267,7 @@ describe("session event diagnostics", () => {
         }
         service.reset();
       } finally {
+        performanceNow.mockRestore();
         vi.useRealTimers();
       }
     });

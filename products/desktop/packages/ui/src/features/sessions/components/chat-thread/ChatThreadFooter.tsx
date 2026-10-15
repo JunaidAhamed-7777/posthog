@@ -54,6 +54,10 @@ export function ChatThreadFooter({
     taskId,
     (session) => session?.pausedDurationMs ?? 0,
   );
+  const isCloud = useSessionSelector(
+    taskId,
+    (session) => session?.isCloud ?? false,
+  );
 
   return (
     <div className="pt-1">
@@ -73,6 +77,7 @@ export function ChatThreadFooter({
         lastGenerationDuration={lastGenerationDurationMs(
           lastTurnInfo,
           pausedDurationMs,
+          isCloud,
         )}
         lastStopReason={lastTurnInfo?.stopReason}
         queuedCount={queuedCount}
