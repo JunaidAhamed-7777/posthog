@@ -44,10 +44,12 @@ function createHarness({
   spyConnect = true,
   persistedPromptTimings = {},
   rendererStartedAtMs = 0,
+  rendererLifecycleId = "renderer",
 }: {
   spyConnect?: boolean;
   persistedPromptTimings?: Record<string, PersistedPromptTiming>;
   rendererStartedAtMs?: number;
+  rendererLifecycleId?: string;
 } = {}) {
   const sessions: Record<string, AgentSession> = {};
   let rendererClosingHandler: ((closedAt: number) => void) | undefined;
@@ -91,6 +93,7 @@ function createHarness({
       delete persistedPromptTimings[taskRunId];
     },
     rendererStartedAtMs,
+    rendererLifecycleId,
     subscribeToRendererClosing: (handler: (closedAt: number) => void) => {
       rendererClosingHandler = handler;
       return vi.fn();
@@ -429,6 +432,7 @@ describe("SessionService run-less local task recovery", () => {
       spyConnect: false,
       persistedPromptTimings,
       rendererStartedAtMs: 0,
+      rendererLifecycleId: "before-restart",
     });
     firstRenderer.sessions["run-task-1"] = {
       ...makeSession(task.id),
@@ -476,6 +480,7 @@ describe("SessionService run-less local task recovery", () => {
       spyConnect: false,
       persistedPromptTimings,
       rendererStartedAtMs: 60_000,
+      rendererLifecycleId: "after-restart",
     });
 
     await reconnectToLocalSession(firstReopen.service, task, rawEntries);
@@ -487,10 +492,53 @@ describe("SessionService run-less local task recovery", () => {
       spyConnect: false,
       persistedPromptTimings,
       rendererStartedAtMs: 70_000,
+      rendererLifecycleId: "after-restart",
     });
     await reconnectToLocalSession(secondReopen.service, task, rawEntries);
 
     expect(secondReopen.sessions["run-task-1"].pausedDurationMs).toBe(30_000);
+  });
+
+  it("keeps generation time across a renderer reload in the same app process", async () => {
+    const task = makeTask();
+    const persistedPromptTimings: Record<string, PersistedPromptTiming> = {
+      "run-task-1": {
+        promptId: 1,
+        promptStartedAt: 1_000,
+        pausedDurationMs: 0,
+        rendererClosedAt: 20_000,
+        rendererLifecycleId: "same-app",
+      },
+    };
+    const rawEntries: StoredLogEntry[] = [
+      {
+        type: "notification",
+        timestamp: new Date(1_000).toISOString(),
+        notification: {
+          id: 1,
+          method: "session/prompt",
+          params: { prompt: [{ type: "text", text: "Keep working" }] },
+        },
+      },
+      {
+        type: "notification",
+        timestamp: new Date(50_000).toISOString(),
+        notification: {
+          id: 1,
+          result: { stopReason: "end_turn" },
+        },
+      },
+    ];
+    const reloaded = createHarness({
+      spyConnect: false,
+      persistedPromptTimings,
+      rendererStartedAtMs: 30_000,
+      rendererLifecycleId: "same-app",
+    });
+
+    await reconnectToLocalSession(reloaded.service, task, rawEntries);
+
+    expect(reloaded.sessions["run-task-1"].pausedDurationMs).toBe(0);
   });
 
   it("persists suspended time when the renderer closes before another event", () => {
@@ -515,6 +563,7 @@ describe("SessionService run-less local task recovery", () => {
       promptStartedAt: 1_000,
       pausedDurationMs: 15_000,
       rendererClosedAt: 21_000,
+      rendererLifecycleId: "renderer",
     });
   });
 

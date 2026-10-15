@@ -487,41 +487,89 @@ describe("session event diagnostics", () => {
       }
     });
 
-    it("counts suspended and permission-wait time exactly once", async () => {
+    it("does not carry a completed turn's deferred suspend into the next turn", () => {
       vi.useFakeTimers();
       try {
-        const beforeJump = Date.now();
-        const { service, sessions, events, permissions, emitSuspend } =
-          createHarness({
-            isPromptPending: true,
-            promptStartedAt: beforeJump,
-            pausedDurationMs: 0,
-            currentPromptId: 1,
-          });
-        events.subscriptions[0].handlers.onData({ ...chunk, ts: beforeJump });
-        vi.advanceTimersByTime(20);
-
-        vi.setSystemTime(beforeJump + 2 * 60 * 60_000);
-        emitSuspend(beforeJump, Date.now());
-        permissions.subscriptions[0].handlers.onData({
-          taskRunId: RUN_ID,
-          toolCall: { toolCallId: "tool-1", title: "Run command" },
-          options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+        const beforeSuspend = Date.now();
+        const { service, sessions, events, emitSuspend } = createHarness({
+          isPromptPending: true,
+          promptStartedAt: beforeSuspend - 1_000,
+          pausedDurationMs: 0,
+          currentPromptId: 1,
         });
 
-        vi.setSystemTime(Date.now() + 5 * 60_000);
-        await service.respondToPermission("task-1", "tool-1", "allow");
-        events.subscriptions[0].handlers.onData({ ...chunk, ts: Date.now() });
+        vi.setSystemTime(beforeSuspend + 2 * 60 * 60_000);
+        emitSuspend(beforeSuspend, Date.now());
+        events.subscriptions[0].handlers.onData(completion(beforeSuspend - 1));
         vi.advanceTimersByTime(20);
 
-        expect(sessions[RUN_ID].pausedDurationMs).toBe(
-          2 * 60 * 60_000 + 5 * 60_000,
-        );
+        Object.assign(sessions[RUN_ID], {
+          isPromptPending: true,
+          promptStartedAt: Date.now(),
+          pausedDurationMs: 0,
+          currentPromptId: null,
+        });
+        events.subscriptions[0].handlers.onData(promptEcho(Date.now(), 2));
+        vi.advanceTimersByTime(20);
+
+        expect(sessions[RUN_ID].pausedDurationMs).toBe(0);
         service.reset();
       } finally {
         vi.useRealTimers();
       }
     });
+
+    it.each([
+      {
+        name: "local turns",
+        isCloud: false,
+        expectedPausedMs: 2 * 60 * 60_000 + 5 * 60_000,
+      },
+      {
+        name: "cloud turns",
+        isCloud: true,
+        expectedPausedMs: 5 * 60_000,
+      },
+    ])(
+      "counts suspended and permission-wait time exactly once for $name",
+      async ({ isCloud, expectedPausedMs }) => {
+        vi.useFakeTimers();
+        try {
+          const beforeJump = Date.now();
+          const { service, sessions, events, permissions, emitSuspend } =
+            createHarness({
+              isCloud,
+              isPromptPending: true,
+              promptStartedAt: beforeJump,
+              pausedDurationMs: 0,
+              currentPromptId: 1,
+            });
+          events.subscriptions[0].handlers.onData({ ...chunk, ts: beforeJump });
+          vi.advanceTimersByTime(20);
+
+          vi.setSystemTime(beforeJump + 2 * 60 * 60_000);
+          emitSuspend(beforeJump, Date.now());
+          permissions.subscriptions[0].handlers.onData({
+            taskRunId: RUN_ID,
+            toolCall: { toolCallId: "tool-1", title: "Run command" },
+            options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+          });
+
+          vi.setSystemTime(Date.now() + 5 * 60_000);
+          await service.respondToPermission("task-1", "tool-1", "allow");
+          events.subscriptions[0].handlers.onData({
+            ...chunk,
+            ts: Date.now(),
+          });
+          vi.advanceTimersByTime(20);
+
+          expect(sessions[RUN_ID].pausedDurationMs).toBe(expectedPausedMs);
+          service.reset();
+        } finally {
+          vi.useRealTimers();
+        }
+      },
+    );
 
     it("keeps checking silence while a pending session reconnects", () => {
       vi.useFakeTimers();

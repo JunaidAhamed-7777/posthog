@@ -201,6 +201,13 @@ vi.mock(
   () => mockSessionConfigStore,
 );
 
+vi.mock("@posthog/ui/features/sessions/sessionTimingStore", () => ({
+  getPersistedPromptTiming: vi.fn(() => undefined),
+  setPersistedPromptTiming: vi.fn(),
+  removePersistedPromptTiming: vi.fn(),
+  waitForPersistedPromptTiming: vi.fn().mockResolvedValue(undefined),
+}));
+
 const mockAdapterFns = vi.hoisted(() => ({
   setAdapter: vi.fn(),
   getAdapter: vi.fn(),

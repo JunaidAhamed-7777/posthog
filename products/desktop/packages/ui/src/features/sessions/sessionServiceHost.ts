@@ -52,6 +52,7 @@ import {
   getPersistedPromptTiming,
   removePersistedPromptTiming,
   setPersistedPromptTiming,
+  waitForPersistedPromptTiming,
 } from "@posthog/ui/features/sessions/sessionTimingStore";
 import {
   getEffectiveCustomInstructions,
@@ -75,6 +76,19 @@ import { resolveLocalSkillPrompt } from "../message-editor/commands";
 export { SessionService };
 
 const log = logger.scope("session-service");
+const RENDERER_LIFECYCLE_ID_KEY = "posthog-renderer-lifecycle-id";
+
+function getRendererLifecycleId(): string {
+  try {
+    const existing = window.sessionStorage.getItem(RENDERER_LIFECYCLE_ID_KEY);
+    if (existing) return existing;
+    const created = crypto.randomUUID();
+    window.sessionStorage.setItem(RENDERER_LIFECYCLE_ID_KEY, created);
+    return created;
+  } catch {
+    return String(performance.timeOrigin);
+  }
+}
 
 export function shouldEnableSpokenNarration(
   userOptedIn: boolean,
@@ -127,6 +141,7 @@ function buildSessionServiceDeps(): SessionServiceDeps {
     trpc,
     store: sessionStoreSetters,
     rendererStartedAtMs: performance.timeOrigin,
+    rendererLifecycleId: getRendererLifecycleId(),
     subscribeToRendererClosing: (handler) => {
       const onPageHide = (): void => {
         handler(Date.now());
@@ -169,6 +184,7 @@ function buildSessionServiceDeps(): SessionServiceDeps {
       getPersistedConfigOptions(taskRunId) ?? undefined,
     setPersistedConfigOptions,
     removePersistedConfigOptions,
+    waitForPersistedPromptTiming,
     getPersistedPromptTiming,
     setPersistedPromptTiming,
     removePersistedPromptTiming,
