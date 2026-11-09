@@ -1,4 +1,5 @@
 export interface IPowerManager {
+  onSuspend(handler: () => void): () => void;
   onResume(handler: () => void): () => void;
   preventSleep(reason: string): () => void;
   hasBuiltInBattery(): Promise<boolean>;

@@ -54,6 +54,10 @@ const neverEmit = publicProcedure.subscription(async function* (opts) {
   });
 });
 
+const sleepStubRouter = router({
+  onSuspendCycle: neverEmit,
+});
+
 // Deep links are a desktop URL-scheme feature (posthog-code://); the browser has
 // no equivalent, so every pending-link query resolves null and every open-*
 // stream never emits. Stubbed to silence NOT_FOUND noise from __root's deep-link
@@ -529,6 +533,7 @@ export const webHostRouter = router({
   githubIntegration: githubIntegrationRouter,
   logs: logsStubRouter,
   os: osStubRouter,
+  sleep: sleepStubRouter,
   skills: skillsStubRouter,
   slackIntegration: slackIntegrationRouter,
   workspace: workspaceStubRouter,

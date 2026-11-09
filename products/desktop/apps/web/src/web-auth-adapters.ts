@@ -233,6 +233,10 @@ export class WebAuthConnectivity implements IAuthConnectivity {
 }
 
 export const webPowerManager: IPowerManager = {
+  onSuspend(_handler: () => void): () => void {
+    return () => {};
+  },
+
   onResume(handler: () => void): () => void {
     // Closest web analog to an OS resume signal: the tab becoming visible
     // again also covers waking from sleep.

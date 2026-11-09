@@ -13,6 +13,11 @@ import {
 } from "@posthog/platform/workspace-settings";
 import { inject, injectable, preDestroy } from "inversify";
 
+export interface SuspendCycle {
+  startedAt: number;
+  endedAt: number;
+}
+
 @injectable()
 export class SleepService {
   private enabled: boolean;
@@ -45,6 +50,44 @@ export class SleepService {
 
   hasBuiltInBattery(): Promise<boolean> {
     return this.powerManager.hasBuiltInBattery();
+  }
+
+  async *watchSuspendCycles(
+    signal?: AbortSignal,
+  ): AsyncGenerator<SuspendCycle> {
+    const queue: SuspendCycle[] = [];
+    let suspendedAt: number | null = null;
+    let resolve: (() => void) | null = null;
+    const unsubscribeSuspend = this.powerManager.onSuspend(() => {
+      suspendedAt ??= Date.now();
+    });
+    const unsubscribeResume = this.powerManager.onResume(() => {
+      if (suspendedAt === null) return;
+      queue.push({ startedAt: suspendedAt, endedAt: Date.now() });
+      suspendedAt = null;
+      resolve?.();
+    });
+    try {
+      while (!signal?.aborted) {
+        if (queue.length === 0) {
+          await new Promise<void>((next) => {
+            const finish = (): void => {
+              signal?.removeEventListener("abort", finish);
+              next();
+            };
+            resolve = finish;
+            signal?.addEventListener("abort", finish, { once: true });
+          });
+          resolve = null;
+        }
+        while (queue.length > 0) {
+          yield queue.shift() as SuspendCycle;
+        }
+      }
+    } finally {
+      unsubscribeSuspend();
+      unsubscribeResume();
+    }
   }
 
   acquire(activityId: string): void {

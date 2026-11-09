@@ -49,6 +49,12 @@ import {
 } from "@posthog/ui/features/sessions/sessionConfigStore";
 import { sessionStoreSetters } from "@posthog/ui/features/sessions/sessionStore";
 import {
+  getPersistedPromptTiming,
+  removePersistedPromptTiming,
+  setPersistedPromptTiming,
+  waitForPersistedPromptTiming,
+} from "@posthog/ui/features/sessions/sessionTimingStore";
+import {
   getEffectiveCustomInstructions,
   useSettingsStore,
 } from "@posthog/ui/features/settings/settingsStore";
@@ -59,6 +65,7 @@ import {
   buildPermissionToolMetadata,
   track,
 } from "@posthog/ui/shell/posthogAnalyticsImpl";
+import { flushRendererStateWrites } from "@posthog/ui/shell/rendererStorage";
 import { logger } from "../../shell/logger";
 import {
   IMPERATIVE_QUERY_CLIENT,
@@ -69,6 +76,19 @@ import { resolveLocalSkillPrompt } from "../message-editor/commands";
 export { SessionService };
 
 const log = logger.scope("session-service");
+const RENDERER_LIFECYCLE_ID_KEY = "posthog-renderer-lifecycle-id";
+
+function getRendererLifecycleId(): string {
+  try {
+    const existing = window.sessionStorage.getItem(RENDERER_LIFECYCLE_ID_KEY);
+    if (existing) return existing;
+    const created = crypto.randomUUID();
+    window.sessionStorage.setItem(RENDERER_LIFECYCLE_ID_KEY, created);
+    return created;
+  } catch {
+    return String(performance.timeOrigin);
+  }
+}
 
 export function shouldEnableSpokenNarration(
   userOptedIn: boolean,
@@ -120,6 +140,25 @@ function buildSessionServiceDeps(): SessionServiceDeps {
   return {
     trpc,
     store: sessionStoreSetters,
+    rendererStartedAtMs: performance.timeOrigin,
+    rendererLifecycleId: getRendererLifecycleId(),
+    subscribeToRendererClosing: (handler) => {
+      const onPageHide = (): void => {
+        handler(Date.now());
+        void flushRendererStateWrites();
+      };
+      window.addEventListener("pagehide", onPageHide);
+      return () => window.removeEventListener("pagehide", onPageHide);
+    },
+    subscribeToSystemSuspend: (handler) => {
+      const subscription = trpc.sleep.onSuspendCycle.subscribe(undefined, {
+        onData: handler,
+        onError: (error) => {
+          log.warn("System suspend subscription error", { error });
+        },
+      });
+      return () => subscription.unsubscribe();
+    },
     log,
     toast: {
       error: (msg, opts) => toast.error(msg, opts),
@@ -145,6 +184,10 @@ function buildSessionServiceDeps(): SessionServiceDeps {
       getPersistedConfigOptions(taskRunId) ?? undefined,
     setPersistedConfigOptions,
     removePersistedConfigOptions,
+    waitForPersistedPromptTiming,
+    getPersistedPromptTiming,
+    setPersistedPromptTiming,
+    removePersistedPromptTiming,
     adapterStore: {
       getAdapter: (taskRunId) =>
         useSessionAdapterStore.getState().getAdapter(taskRunId),
